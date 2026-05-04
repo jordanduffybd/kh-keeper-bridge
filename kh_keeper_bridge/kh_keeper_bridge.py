@@ -463,8 +463,9 @@ class KHKeeperClient:
 
     async def empty_cuvette(self) -> None:
         """Drain the cuvette via `khCommand/empty`. The web UI sends a
-        4-byte payload `0a ae 60 00` (fixed magic — likely the drain
-        duration). Pass-through verbatim.
+        5-byte payload `00 0a ae 60 00` (leading null + 4 magic bytes —
+        likely a flag byte + drain duration in fixed-point). Verified
+        against captured HAR frames byte-for-byte.
 
         WARNING: the pH probe should not sit dry. This is a low-level
         primitive — always follow with `fill_cuvette()` quickly. Prefer
@@ -473,7 +474,7 @@ class KHKeeperClient:
         if not self._require_idle("empty cuvette"):
             return
         LOGGER.info("Queued: khCommand/empty")
-        await self.queue_command("khCommand", "empty", b"\x0a\xae\x60\x00")
+        await self.queue_command("khCommand", "empty", b"\x00\x0a\xae\x60\x00")
 
     async def fill_cuvette(self, ml: float = 50.0) -> None:
         """Refill the cuvette with fresh aquarium water via
@@ -643,6 +644,14 @@ class KHKeeperClient:
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception("Failed to parse settings: %s", exc)
                     return
+                # Helpful diagnostic: log when used_water_ml ticks up — that's
+                # how we can tell doseAquarium / empty actually did something
+                # physical even though state stays Idle.
+                prev_used = self.last_state.get("used_water_ml")
+                new_used = update.get("used_water_ml")
+                if prev_used is not None and new_used is not None and new_used != prev_used:
+                    LOGGER.info("used_water_ml: %s → %s (Δ %.2f mL)",
+                                prev_used, new_used, new_used - prev_used)
                 self.last_state.update(update)
                 self._connected.set()
                 await self.on_state(dict(self.last_state), self.serial, self.sw_version)
@@ -662,6 +671,11 @@ class KHKeeperClient:
                     ph = round(struct.unpack(">i", payload[:4])[0] / SCALE, 2)
                 except struct.error:
                     return
+                prev_ph = self.last_state.get("ph")
+                if prev_ph != ph:
+                    LOGGER.info("pH UPDATE: %s → %s", prev_ph, ph)
+                else:
+                    LOGGER.info("pH unchanged at %s (cuvette water didn't refresh?)", ph)
                 self.last_state["ph"] = ph
                 await self.on_state(dict(self.last_state), self.serial, self.sw_version)
                 return
@@ -774,22 +788,33 @@ class MQTTPublisher:
         }
 
         sensors = [
-            # (object_id, name, value_template, unit, device_class, state_class, icon)
-            ("kh", "KH", "{{ value_json.kh }}", "dKH", None, "measurement", "mdi:flask"),
-            ("ph", "pH", "{{ value_json.ph }}", None, None, "measurement", "mdi:water-percent"),
-            ("state", "State", "{{ value_json.state }}", None, None, None, "mdi:state-machine"),
-            ("progress", "Measurement Progress", "{{ value_json.state_percent }}", "%", None, "measurement", "mdi:progress-clock"),
-            ("last_alert", "Last Test Result", "{{ value_json.last_test_alert }}", None, None, None, "mdi:alert-circle-check"),
-            ("last_test_time", "Last Test Time", "{{ value_json.last_test_time }}", None, "timestamp", None, "mdi:clock-outline"),
-            ("next_test_time", "Next Test Time", "{{ value_json.next_test_time }}", None, "timestamp", None, "mdi:clock-start"),
-            ("reagent_ml", "Reagent Remaining", "{{ value_json.reagent_ml }}", "mL", None, "measurement", "mdi:beaker"),
-            ("interval", "Measurement Interval", "{{ value_json.interval }}", None, None, None, "mdi:timer-sand"),
-            ("calibration_due", "Calibration Due", "{{ value_json.calibration_due }}", None, "date", None, "mdi:calendar-clock"),
-            ("alarm_kh_low", "KH Alarm Low", "{{ value_json.alarm_kh_low }}", "dKH", None, None, "mdi:arrow-down-bold"),
-            ("alarm_kh_high", "KH Alarm High", "{{ value_json.alarm_kh_high }}", "dKH", None, None, "mdi:arrow-up-bold"),
-            ("adjustment", "KH Adjustment", "{{ value_json.adjustment }}", "dKH", None, None, "mdi:tune-vertical"),
+            # (object_id, name, value_template, unit, device_class, state_class, icon, diagnostic)
+            ("kh", "KH", "{{ value_json.kh }}", "dKH", None, "measurement", "mdi:flask", False),
+            ("ph", "pH", "{{ value_json.ph }}", None, None, "measurement", "mdi:water-percent", False),
+            ("state", "State", "{{ value_json.state }}", None, None, None, "mdi:state-machine", False),
+            ("progress", "Measurement Progress", "{{ value_json.state_percent }}", "%", None, "measurement", "mdi:progress-clock", False),
+            ("last_alert", "Last Test Result", "{{ value_json.last_test_alert }}", None, None, None, "mdi:alert-circle-check", False),
+            ("last_test_time", "Last Test Time", "{{ value_json.last_test_time }}", None, "timestamp", None, "mdi:clock-outline", False),
+            ("next_test_time", "Next Test Time", "{{ value_json.next_test_time }}", None, "timestamp", None, "mdi:clock-start", False),
+            ("reagent_ml", "Reagent Remaining", "{{ value_json.reagent_ml }}", "mL", None, "measurement", "mdi:beaker", False),
+            ("interval", "Measurement Interval", "{{ value_json.interval }}", None, None, None, "mdi:timer-sand", False),
+            ("calibration_due", "Calibration Due", "{{ value_json.calibration_due }}", None, "date", None, "mdi:calendar-clock", False),
+            ("alarm_kh_low", "KH Alarm Low", "{{ value_json.alarm_kh_low }}", "dKH", None, None, "mdi:arrow-down-bold", False),
+            ("alarm_kh_high", "KH Alarm High", "{{ value_json.alarm_kh_high }}", "dKH", None, None, "mdi:arrow-up-bold", False),
+            ("adjustment", "KH Adjustment", "{{ value_json.adjustment }}", "dKH", None, None, "mdi:tune-vertical", False),
+            # Diagnostics — watch these change as commands fire to verify
+            # the device is physically doing what we asked.
+            ("used_water_ml", "Used Water (lifetime)", "{{ value_json.used_water_ml }}", "mL", None, "total_increasing", "mdi:water-pump", True),
+            ("used_water_ml_v0", "Used Water (legacy counter)", "{{ value_json.used_water_ml_v0 }}", "mL", None, "measurement", "mdi:water-pump", True),
+            ("waste_current_ml", "Waste Current", "{{ value_json.waste_current_ml }}", "mL", None, "measurement", "mdi:delete-empty", True),
+            ("waste_limit_ml", "Waste Limit", "{{ value_json.waste_limit_ml }}", "mL", None, None, "mdi:delete-clock", True),
+            ("remeasure_threshold", "Remeasure Threshold", "{{ value_json.remeasure_threshold }}", "dKH", None, None, "mdi:refresh-circle", True),
+            ("mixer_speed", "Mixer Speed", "{{ value_json.mixer_speed }}", None, None, None, "mdi:fan", True),
+            ("state_code", "State Code (raw)", "{{ value_json.state_code }}", None, None, None, "mdi:numeric", True),
+            ("state_percent_raw", "State % (raw)", "{{ value_json.state_percent }}", "%", None, "measurement", "mdi:progress-helper", True),
+            ("interval_code", "Interval Code (raw)", "{{ value_json.interval_code }}", None, None, None, "mdi:numeric", True),
         ]
-        for object_id, name, tmpl, unit, dev_class, state_class, icon in sensors:
+        for object_id, name, tmpl, unit, dev_class, state_class, icon, diag in sensors:
             payload = {
                 "name": name,
                 "unique_id": f"{self.node_prefix}_{serial}_{object_id}",
@@ -807,14 +832,18 @@ class MQTTPublisher:
                 payload["state_class"] = state_class
             if icon:
                 payload["icon"] = icon
+            if diag:
+                payload["entity_category"] = "diagnostic"
 
             topic = f"{self.discovery_prefix}/sensor/{self.node_prefix}_{serial}/{object_id}/config"
             self.client.publish(topic, json.dumps(payload), retain=True)
 
-        # Binary sensors for boolean alerts
-        for object_id, name, tmpl, dev_class, icon in [
-            ("reagent_low", "Reagent Low", "{{ 'ON' if value_json.reagent_low else 'OFF' }}", "problem", "mdi:flask-empty-outline"),
-            ("calibration_warning", "Calibration Due Warning", "{{ 'ON' if value_json.calibration_warning else 'OFF' }}", "problem", "mdi:alert-octagon"),
+        # Binary sensors for boolean alerts and diagnostic flags
+        for object_id, name, tmpl, dev_class, icon, diag in [
+            ("reagent_low", "Reagent Low", "{{ 'ON' if value_json.reagent_low else 'OFF' }}", "problem", "mdi:flask-empty-outline", False),
+            ("calibration_warning", "Calibration Due Warning", "{{ 'ON' if value_json.calibration_warning else 'OFF' }}", "problem", "mdi:alert-octagon", False),
+            ("water_return", "Water Return", "{{ 'ON' if value_json.water_return else 'OFF' }}", None, "mdi:water-sync", True),
+            ("light", "Internal Light", "{{ 'ON' if value_json.light else 'OFF' }}", "light", "mdi:lightbulb", True),
         ]:
             payload = {
                 "name": name,
@@ -823,10 +852,13 @@ class MQTTPublisher:
                 "state_topic": self._state_topic(serial),
                 "value_template": tmpl,
                 "device": device,
-                "device_class": dev_class,
                 "icon": icon,
                 **availability,
             }
+            if dev_class:
+                payload["device_class"] = dev_class
+            if diag:
+                payload["entity_category"] = "diagnostic"
             topic = f"{self.discovery_prefix}/binary_sensor/{self.node_prefix}_{serial}/{object_id}/config"
             self.client.publish(topic, json.dumps(payload), retain=True)
 
@@ -840,15 +872,22 @@ class MQTTPublisher:
              lambda _payload: self.client_ref.refresh_ph(50.0)),
             ("measure_ph", "Measure pH (current cuvette water)", "mdi:water-percent",
              lambda _payload: self.client_ref.measure_ph()),
-            # Empty/Fill standalone buttons intentionally NOT exposed —
-            # the pH probe must not sit dry. Use Refresh pH (which does
-            # empty + immediate refill) for routine use. Available via
-            # CLI flags for diagnostics.
+            # Diagnostic-only — pH probe must not sit dry. Marked diagnostic
+            # so it lives under the device's diagnostics panel rather than
+            # alongside routine controls.
+            ("empty_cuvette", "DIAG: Empty Cuvette (drain only)", "mdi:water-minus",
+             lambda _payload: self.client_ref.empty_cuvette()),
+            ("fill_cuvette", "DIAG: Fill Cuvette 50 mL", "mdi:water-plus",
+             lambda _payload: self.client_ref.fill_cuvette(50.0)),
             ("dose_aquarium_test", "Aquarium Pump Accuracy Test (50 mL)", "mdi:water-pump",
              lambda _payload: self.client_ref.dose_aquarium_test(50.0)),
             ("dose_reagent_test", "Reagent Pump Accuracy Test (5 mL)", "mdi:beaker-plus",
              lambda _payload: self.client_ref.dose_reagent_test(5.0)),
         ]
+        # Buttons whose object_id starts with these prefixes are flagged as
+        # diagnostic in HA so they don't clutter the main entities view.
+        diag_button_ids = {"empty_cuvette", "fill_cuvette",
+                           "dose_aquarium_test", "dose_reagent_test"}
         for object_id, name, icon, handler in buttons:
             cmd_topic = f"{self.node_prefix}/{serial}/cmd/{object_id}"
             payload = {
@@ -860,6 +899,8 @@ class MQTTPublisher:
                 "icon": icon,
                 **availability,
             }
+            if object_id in diag_button_ids:
+                payload["entity_category"] = "diagnostic"
             topic = f"{self.discovery_prefix}/button/{self.node_prefix}_{serial}/{object_id}/config"
             self.client.publish(topic, json.dumps(payload), retain=True)
             self.client.subscribe(cmd_topic)

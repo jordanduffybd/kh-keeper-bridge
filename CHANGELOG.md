@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.7 — diagnostic sensors and buttons
+
+- **Empty Cuvette** and **Fill Cuvette 50 mL** buttons re-added under the diagnostics panel for debugging. Prefixed `DIAG:` and grouped with the pump-accuracy tests, so easy to find but unlikely to be tapped accidentally during normal use. The pH-probe-must-stay-wet warning still applies — use them with care.
+- Surfaces every parsed-but-previously-hidden field from the device's settings frame as a HA diagnostic sensor:
+  - **Used Water (lifetime)** — cumulative aquarium water pumped (in mL). Watch this tick up by ~50 after each Refresh pH.
+  - **Used Water (legacy counter)** — older per-test water counter from the device.
+  - **Waste Current / Waste Limit** — waste-tank fill state.
+  - **Remeasure Threshold** — dKH delta that triggers an automatic remeasurement.
+  - **Mixer Speed** — Slow/Medium/Fast.
+  - **State Code (raw) / State % (raw) / Interval Code (raw)** — raw protocol values, useful for debugging state-machine behaviour.
+  - **Water Return / Internal Light** — boolean device flags.
+- Marked with `entity_category: diagnostic` so they appear under the device's diagnostics panel in HA, not in the main entities view.
+- Lets you watch the device's behaviour live as you press buttons — particularly Used Water (lifetime), which is the most reliable proof that doseAquarium actually pumped.
+
+## 0.1.6 — empty-cuvette payload fix + observability
+
+- **Fixed `khCommand/empty` payload length** — was 4 bytes, should be 5 (`00 0a ae 60 00`). Verified against HAR capture: empty frame is 53 bytes, doseAquarium frame is 59 bytes, the 7-char subcommand-name difference accounts for only 6 bytes — the missing byte was a leading null in the empty payload. Sending the wrong length almost certainly caused the device to silently no-op the drain.
+- **pH change logging** — when a `khRefresh/pH` frame arrives, the bridge now logs `pH UPDATE: 8.13 → 8.34` (or `pH unchanged` if the value didn't move). Makes it easy to spot whether a Refresh pH actually got fresh tank water in the cuvette.
+- **used_water_ml delta logging** — when settings frames arrive, log any change in cumulative water-used. Confirms doseAquarium physically pumped (state stays Idle through these ops, so you can't tell from state alone).
+- Note: state staying at "Idle" through empty/doseAquarium/measurePh is normal device behaviour — the device treats these as instant from the state-machine's POV. Verified against the web UI's HAR captures.
+
 ## 0.1.5 — proper pH refresh (HAR-verified bytes)
 
 - Captured exact byte payloads from the device's web UI HAR export. Replaces the previous guesswork:
