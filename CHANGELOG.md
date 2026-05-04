@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8 — manual & automatic state refresh
+
+- New **Refresh State** HA button. Re-sends `khConnect/join` to force the device to broadcast a fresh `khRefresh/settings` frame, which carries every diagnostic field (used_water_ml, waste_*, mixer, alarms, calibration, etc.).
+- **Auto-refresh after every action.** `measure_ph`, `empty_cuvette`, and `fill_cuvette` now queue a state refresh immediately after the command, so all the *other* sensors (everything except pH) update too. pH already updates fine via the dedicated `khRefresh/pH` frame the device sends back from measurePh — the issue was the rest of the diagnostics looking frozen because settings frames are only auto-pushed on join, end-of-measurement, and doseAquarium.
+
 ## 0.1.7 — diagnostic sensors and buttons
 
 - **Empty Cuvette** and **Fill Cuvette 50 mL** buttons re-added under the diagnostics panel for debugging. Prefixed `DIAG:` and grouped with the pump-accuracy tests, so easy to find but unlikely to be tapped accidentally during normal use. The pH-probe-must-stay-wet warning still applies — use them with care.

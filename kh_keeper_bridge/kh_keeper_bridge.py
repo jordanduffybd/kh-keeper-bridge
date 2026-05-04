@@ -446,6 +446,22 @@ class KHKeeperClient:
             return False
         return True
 
+    async def refresh_state(self) -> None:
+        """Force the device to re-broadcast its current settings frame.
+
+        Re-sending `khConnect/join` makes the device reply with a full
+        `khRefresh/settings`, which gets parsed into every sensor we
+        expose. Useful when nothing's changed state-wise but you want
+        to see the current state of all diagnostic fields after running
+        a sequence of commands.
+        """
+        if not self.serial:
+            LOGGER.warning("refresh_state skipped — no serial yet")
+            return
+        LOGGER.info("Queued: refresh state (khConnect/join)")
+        payload = self.serial.encode("ascii") + b"\x00"
+        await self.queue_command("khConnect", "join", payload)
+
     async def measure_ph(self) -> None:
         """Trigger a fresh pH reading via `khCommand/measurePh`. Empty
         payload. Device replies with a `khRefresh/pH` frame containing
@@ -460,6 +476,8 @@ class KHKeeperClient:
             return
         LOGGER.info("Queued: khCommand/measurePh")
         await self.queue_command("khCommand", "measurePh", b"")
+        # Force a settings re-broadcast so every sensor refreshes.
+        await self.refresh_state()
 
     async def empty_cuvette(self) -> None:
         """Drain the cuvette via `khCommand/empty`. The web UI sends a
@@ -475,6 +493,7 @@ class KHKeeperClient:
             return
         LOGGER.info("Queued: khCommand/empty")
         await self.queue_command("khCommand", "empty", b"\x00\x0a\xae\x60\x00")
+        await self.refresh_state()
 
     async def fill_cuvette(self, ml: float = 50.0) -> None:
         """Refill the cuvette with fresh aquarium water via
@@ -486,6 +505,7 @@ class KHKeeperClient:
         payload = struct.pack(">i", raw)
         LOGGER.info("Queued: khCommand/doseAquarium %.1f mL", ml)
         await self.queue_command("khCommand", "doseAquarium", payload)
+        await self.refresh_state()
 
     async def refresh_ph(self, fill_ml: float = 50.0) -> None:
         """Get a fresh pH reading on tank water — no reagent burned.
@@ -868,6 +888,8 @@ class MQTTPublisher:
              lambda _payload: self.client_ref.take_now()),
             ("cancel_measurement", "Cancel Measurement", "mdi:cancel",
              lambda _payload: self.client_ref.cancel_measurement()),
+            ("refresh_state", "Refresh State (re-fetch all sensors)", "mdi:refresh",
+             lambda _payload: self.client_ref.refresh_state()),
             ("refresh_ph", "Refresh pH (empty + refill + measure)", "mdi:ph",
              lambda _payload: self.client_ref.refresh_ph(50.0)),
             ("measure_ph", "Measure pH (current cuvette water)", "mdi:water-percent",
