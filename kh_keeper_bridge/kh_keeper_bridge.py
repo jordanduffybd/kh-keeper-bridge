@@ -205,6 +205,10 @@ def parse_settings(payload: bytes) -> dict[str, Any]:
     out["reagent_ml"] = round(r.fixed(), 2)
     out["reagent_low"] = bool(r.u8())
 
+    # Device sends local-time fields with no tz. HA's `device_class: timestamp`
+    # rejects naive datetimes ("Unknown" in UI), so tag them with system local tz.
+    local_tz = datetime.now().astimezone().tzinfo
+
     history_count = r.u8()
     history: list[dict[str, Any]] = []
     for _ in range(history_count):
@@ -218,7 +222,10 @@ def parse_settings(payload: bytes) -> dict[str, Any]:
         type_code = r.u8()
         alert = r.u8()
         try:
-            ts = datetime(year, month, day, hour, minute).isoformat() if year > 0 else None
+            ts = (
+                datetime(year, month, day, hour, minute, tzinfo=local_tz).isoformat()
+                if year > 0 else None
+            )
         except ValueError:
             ts = None
         history.append({
@@ -266,7 +273,10 @@ def parse_settings(payload: bytes) -> dict[str, Any]:
         nxt_hour = r.u8()
         nxt_minute = r.u8()
         out["next_test_time"] = (
-            datetime(nxt_year, nxt_month, nxt_day, nxt_hour, nxt_minute).isoformat()
+            datetime(
+                nxt_year, nxt_month, nxt_day, nxt_hour, nxt_minute,
+                tzinfo=local_tz,
+            ).isoformat()
             if nxt_year > 0 else None
         )
     except (IndexError, ValueError, struct.error):

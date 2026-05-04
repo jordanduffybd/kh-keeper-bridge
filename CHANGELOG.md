@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 — timestamp fix
+
+- Fix `Last Test Time` and `Next Test Time` showing as Unknown in HA — timestamps now serialize as timezone-aware ISO 8601 (HA's `device_class: timestamp` rejects naive datetimes).
+
 ## 0.1.0 — initial release
 
 - Reverse-engineered the KH Keeper local WebSocket protocol (path `/controler`, subprotocol `arduino`)
