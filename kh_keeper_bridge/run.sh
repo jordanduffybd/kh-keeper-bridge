@@ -7,9 +7,11 @@ set -e
 DEVICE_HOST=$(bashio::config 'device_host')
 LOG_LEVEL=$(bashio::config 'log_level')
 TRIGGER_ON_START=$(bashio::config 'trigger_test_on_start')
+PH_REFRESH_INTERVAL=$(bashio::config 'ph_refresh_interval_minutes')
 
 bashio::log.info "KH Keeper IP: ${DEVICE_HOST}"
 bashio::log.info "Log level: ${LOG_LEVEL}"
+bashio::log.info "pH refresh interval: ${PH_REFRESH_INTERVAL} min (0 = off)"
 
 # Pull MQTT broker info from HA's supervisor (Mosquitto add-on or external)
 if ! bashio::services.available "mqtt"; then
@@ -39,6 +41,9 @@ if [[ "${LOG_LEVEL}" == "debug" ]]; then
 fi
 if bashio::var.true "${TRIGGER_ON_START}"; then
     ARGS+=(--trigger-test)
+fi
+if [[ "${PH_REFRESH_INTERVAL}" -gt 0 ]]; then
+    ARGS+=(--ph-refresh-interval "${PH_REFRESH_INTERVAL}")
 fi
 
 exec python3 /app/kh_keeper_bridge.py "${ARGS[@]}"

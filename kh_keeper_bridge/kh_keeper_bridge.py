@@ -430,6 +430,59 @@ class KHKeeperClient:
         LOGGER.info("Queued: dose reagent pump %.2f mL", ml)
         await self.queue_command("khCommand", "doseA", payload)
 
+    async def measure_ph(self) -> None:
+        """Trigger a fresh pH reading via `khCommand/measurePh`. Empty
+        payload. Device replies with a `khRefresh/pH` frame containing
+        the new value (4-byte fixed-point) within ~1s. No reagent.
+
+        NOTE: pH is measured on whatever water is currently in the
+        cuvette, which is usually stale from the last KH test. For a
+        useful tank reading, use refresh_ph() which empties + refills
+        + measures.
+        """
+        LOGGER.info("Queued: khCommand/measurePh")
+        await self.queue_command("khCommand", "measurePh", b"")
+
+    async def empty_cuvette(self) -> None:
+        """Drain the cuvette via `khCommand/empty`. The web UI sends a
+        4-byte payload `0a ae 60 00` (fixed magic — likely the drain
+        duration). Pass-through verbatim.
+
+        WARNING: the pH probe should not sit dry. This is a low-level
+        primitive — always follow with `fill_cuvette()` quickly. Prefer
+        `refresh_ph()` for routine use, which sequences both safely.
+        """
+        LOGGER.info("Queued: khCommand/empty")
+        await self.queue_command("khCommand", "empty", b"\x0a\xae\x60\x00")
+
+    async def fill_cuvette(self, ml: float = 50.0) -> None:
+        """Refill the cuvette with fresh aquarium water via
+        `khCommand/doseAquarium`. Same protocol as the accuracy test —
+        4-byte fixed-point mL × 10000."""
+        raw = int(round(ml * SCALE))
+        payload = struct.pack(">i", raw)
+        LOGGER.info("Queued: khCommand/doseAquarium %.1f mL", ml)
+        await self.queue_command("khCommand", "doseAquarium", payload)
+
+    async def refresh_ph(self, fill_ml: float = 50.0) -> None:
+        """Get a fresh pH reading on tank water — no reagent burned.
+
+        Sequence: empty → fill (fresh aquarium water) → measurePh.
+        Queues empty + fill back-to-back so the device drives them with
+        minimal dry time on the pH probe. measurePh waits until the
+        cuvette has water again.
+        """
+        LOGGER.info("Queued: refresh pH (empty → fill %.1f mL → measurePh)", fill_ml)
+        # Queue empty + fill immediately — the device has its own pump
+        # state machine; sequencing them tightly keeps the pH probe wet
+        # (drain runs, fill kicks off as soon as drain completes).
+        await self.empty_cuvette()
+        await self.fill_cuvette(fill_ml)
+        # Wait for both pump operations to complete before measuring.
+        # Drain ~18s + fill at ~1 mL/s for 50 mL = ~50s. Buffer + 5s.
+        await asyncio.sleep(55)
+        await self.measure_ph()
+
     async def wait_until_ready(self) -> None:
         await self._connected.wait()
 
@@ -599,6 +652,11 @@ class KHKeeperClient:
         payload = self.serial.encode("ascii") + b"\x00"
         LOGGER.info("Joining KH stream as %s", self.serial)
         await ws.send(encode_frame(self.serial, "khConnect", "join", txid, payload))
+        # The web UI also sends `get/user` right after join. We don't act
+        # on the user reply, but sending it puts the device into the same
+        # session state as the browser does — empirically the gate for
+        # some commands working.
+        await ws.send(encode_frame(self.serial, "get", "user", "", b""))
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +797,14 @@ class MQTTPublisher:
              lambda _payload: self.client_ref.take_now()),
             ("cancel_measurement", "Cancel Measurement", "mdi:cancel",
              lambda _payload: self.client_ref.cancel_measurement()),
+            ("refresh_ph", "Refresh pH (empty + refill + measure)", "mdi:ph",
+             lambda _payload: self.client_ref.refresh_ph(50.0)),
+            ("measure_ph", "Measure pH (current cuvette water)", "mdi:water-percent",
+             lambda _payload: self.client_ref.measure_ph()),
+            # Empty/Fill standalone buttons intentionally NOT exposed —
+            # the pH probe must not sit dry. Use Refresh pH (which does
+            # empty + immediate refill) for routine use. Available via
+            # CLI flags for diagnostics.
             ("dose_aquarium_test", "Aquarium Pump Accuracy Test (50 mL)", "mdi:water-pump",
              lambda _payload: self.client_ref.dose_aquarium_test(50.0)),
             ("dose_reagent_test", "Reagent Pump Accuracy Test (5 mL)", "mdi:beaker-plus",
@@ -886,6 +952,23 @@ class MQTTPublisher:
 # Main
 # ---------------------------------------------------------------------------
 
+async def _ph_refresh_scheduler(client: "KHKeeperClient", interval_minutes: int) -> None:
+    """Periodic pH refresh task. Skips when the device is busy (state != Idle)
+    so we never interfere with a scheduled KH measurement."""
+    LOGGER.info("pH refresh scheduler enabled — every %d min", interval_minutes)
+    # Wait one interval before the first refresh so we don't fire during startup.
+    while True:
+        await asyncio.sleep(interval_minutes * 60)
+        state = client.last_state.get("state")
+        if state and state != "Idle":
+            LOGGER.info("pH refresh skipped — device busy (state=%s)", state)
+            continue
+        try:
+            await client.refresh_ph(50.0)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Scheduled pH refresh failed: %s", exc)
+
+
 async def main_async(args) -> None:
     loop = asyncio.get_running_loop()
 
@@ -894,6 +977,10 @@ async def main_async(args) -> None:
 
     handler = print_handler if args.test else _noop_handler
     client = KHKeeperClient(args.host, handler)
+
+    # Optional periodic pH refresh (independent of the device's KH test cadence).
+    if args.ph_refresh_interval and args.ph_refresh_interval > 0:
+        asyncio.create_task(_ph_refresh_scheduler(client, args.ph_refresh_interval))
 
     if not args.test:
         publisher = MQTTPublisher(
@@ -930,6 +1017,16 @@ async def main_async(args) -> None:
         one_shots.append(("dose_aquarium_test", lambda: client.dose_aquarium_test(50.0)))
     if args.dose_reagent_test:
         one_shots.append(("dose_reagent_test", lambda: client.dose_reagent_test(5.0)))
+    if args.empty_cuvette:
+        one_shots.append(("empty_cuvette", lambda: client.empty_cuvette()))
+    if args.fill_cuvette is not None:
+        one_shots.append((f"fill_cuvette={args.fill_cuvette}",
+                          lambda: client.fill_cuvette(args.fill_cuvette)))
+    if args.measure_ph:
+        one_shots.append(("measure_ph", lambda: client.measure_ph()))
+    if args.refresh_ph is not None:
+        one_shots.append((f"refresh_ph={args.refresh_ph}",
+                          lambda: client.refresh_ph(args.refresh_ph)))
 
     if one_shots:
         async def _run_one_shots():
@@ -967,6 +1064,19 @@ def main() -> None:
                         help="Run aquarium pump for 50 mL (accuracy verification)")
     parser.add_argument("--dose-reagent-test", action="store_true",
                         help="Run reagent pump for 5 mL (accuracy verification)")
+    parser.add_argument("--empty-cuvette", action="store_true",
+                        help="Drain the cuvette only (khCommand/empty)")
+    parser.add_argument("--fill-cuvette", type=float, default=None, metavar="ML",
+                        help="Refill the cuvette with N mL of fresh tank water")
+    parser.add_argument("--measure-ph", action="store_true",
+                        help="Trigger one immediate pH read (khCommand/measurePh) "
+                             "on whatever water is currently in the cuvette")
+    parser.add_argument("--refresh-ph", type=float, default=None, metavar="ML",
+                        help="Full pH refresh: empty → refill (ML, default 50) → "
+                             "measurePh. ~50s end-to-end. No reagent used.")
+    parser.add_argument("--ph-refresh-interval", type=int, default=0, metavar="MIN",
+                        help="If >0, run a full pH refresh every N minutes "
+                             "(skips when device is busy). Independent of KH test cadence.")
     parser.add_argument("--mqtt-host", help="MQTT broker host (required unless --test)")
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--mqtt-user")
