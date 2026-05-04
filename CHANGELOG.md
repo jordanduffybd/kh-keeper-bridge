@@ -10,6 +10,8 @@
 - `Measure pH` button (reads current cuvette water — useful right after a real KH test or manual refill).
 - **Empty / Fill standalone buttons intentionally NOT exposed in HA** — the pH probe should not sit dry, so we don't expose primitives that could leave it that way. Available via CLI for diagnostics.
 - Refresh pH sequence queues empty + fill back-to-back to minimize the dry window on the probe.
+- **All pump/measurement commands now refuse to run while the device is non-Idle** (e.g. mid-KH test). Pressing Refresh pH or Measure pH during a real measurement was observed to abort the test and drop the WS connection. Bridge now logs a warning and skips instead.
+- **Reconnect backoff resets on transient drops.** The device cycles its WS connection ~5s after some commands (e.g. measurePh) — observed firmware behaviour, can't be fixed from our side. Previously the bridge would wait up to 60s before reconnecting. Now if we were actively connected before the drop, we reconnect within 1s.
 - Bridge now sends `get/user` after `khConnect/join` to match the web UI's session handshake.
 - **Optional periodic pH refresh** via the new `ph_refresh_interval_minutes` add-on option (default 0 = off). Set e.g. `60` to refresh pH every hour, independent of the device's KH test cadence (which runs on its own schedule, e.g. 4-hourly). The scheduler skips the refresh if the device is busy with a real measurement so it never collides.
 - CLI: `--measure-ph`, `--refresh-ph ML`, `--fill-cuvette ML`, `--ph-refresh-interval MIN` flags.

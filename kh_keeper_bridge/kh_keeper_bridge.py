@@ -430,6 +430,22 @@ class KHKeeperClient:
         LOGGER.info("Queued: dose reagent pump %.2f mL", ml)
         await self.queue_command("khCommand", "doseA", payload)
 
+    def _require_idle(self, action: str) -> bool:
+        """Return True if it's safe to issue a non-measurement command.
+        Refuses if the device is in the middle of a real KH test or any
+        other non-idle state — sending pump/measurePh commands during
+        a measurement has been observed to abort the test and drop the
+        WS connection.
+        """
+        state = self.last_state.get("state")
+        if state and state != "Idle":
+            LOGGER.warning(
+                "%s refused — device busy (state=%s). Wait until Idle.",
+                action, state,
+            )
+            return False
+        return True
+
     async def measure_ph(self) -> None:
         """Trigger a fresh pH reading via `khCommand/measurePh`. Empty
         payload. Device replies with a `khRefresh/pH` frame containing
@@ -440,6 +456,8 @@ class KHKeeperClient:
         useful tank reading, use refresh_ph() which empties + refills
         + measures.
         """
+        if not self._require_idle("measurePh"):
+            return
         LOGGER.info("Queued: khCommand/measurePh")
         await self.queue_command("khCommand", "measurePh", b"")
 
@@ -452,6 +470,8 @@ class KHKeeperClient:
         primitive — always follow with `fill_cuvette()` quickly. Prefer
         `refresh_ph()` for routine use, which sequences both safely.
         """
+        if not self._require_idle("empty cuvette"):
+            return
         LOGGER.info("Queued: khCommand/empty")
         await self.queue_command("khCommand", "empty", b"\x0a\xae\x60\x00")
 
@@ -459,6 +479,8 @@ class KHKeeperClient:
         """Refill the cuvette with fresh aquarium water via
         `khCommand/doseAquarium`. Same protocol as the accuracy test —
         4-byte fixed-point mL × 10000."""
+        if not self._require_idle("fill cuvette"):
+            return
         raw = int(round(ml * SCALE))
         payload = struct.pack(">i", raw)
         LOGGER.info("Queued: khCommand/doseAquarium %.1f mL", ml)
@@ -471,17 +493,21 @@ class KHKeeperClient:
         Queues empty + fill back-to-back so the device drives them with
         minimal dry time on the pH probe. measurePh waits until the
         cuvette has water again.
+
+        Refuses to run if the device is busy with another operation.
         """
+        if not self._require_idle("refresh pH"):
+            return
         LOGGER.info("Queued: refresh pH (empty → fill %.1f mL → measurePh)", fill_ml)
-        # Queue empty + fill immediately — the device has its own pump
-        # state machine; sequencing them tightly keeps the pH probe wet
-        # (drain runs, fill kicks off as soon as drain completes).
-        await self.empty_cuvette()
-        await self.fill_cuvette(fill_ml)
+        # The internal _require_idle calls in empty/fill/measure will
+        # be skipped because we already checked, but they're cheap.
+        await self.queue_command("khCommand", "empty", b"\x0a\xae\x60\x00")
+        raw = int(round(fill_ml * SCALE))
+        await self.queue_command("khCommand", "doseAquarium", struct.pack(">i", raw))
         # Wait for both pump operations to complete before measuring.
         # Drain ~18s + fill at ~1 mL/s for 50 mL = ~50s. Buffer + 5s.
         await asyncio.sleep(55)
-        await self.measure_ph()
+        await self.queue_command("khCommand", "measurePh", b"")
 
     async def wait_until_ready(self) -> None:
         await self._connected.wait()
@@ -493,7 +519,14 @@ class KHKeeperClient:
                 await self._run_once()
                 backoff = 1
             except Exception as exc:  # noqa: BLE001
+                was_connected = self._connected.is_set()
                 self._connected.clear()
+                # Transient drops (the device cycles its WS sometimes,
+                # e.g. ~5s after measurePh) shouldn't compound into
+                # minute-long retry waits. Reset to 1s if we were
+                # actively connected before the drop.
+                if was_connected:
+                    backoff = 1
                 LOGGER.warning("Connection failed: %s. Retrying in %ds", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
@@ -569,7 +602,13 @@ class KHKeeperClient:
                 if not self.serial:
                     LOGGER.warning("Drop command %s/%s — no serial", command, subcommand)
                     continue
-                txid = f"cmd_{int(time.time() * 1000)}"
+                # The web UI uses bare millisecond timestamps as txids
+                # (e.g. "1777878037067"). Earlier we prefixed with "cmd_"
+                # which is the only byte-level difference between the
+                # web UI's measurePh frame (52b) and ours (56b) — and
+                # the only frame format that triggers a WS drop on the
+                # device. Match the web UI exactly.
+                txid = str(int(time.time() * 1000))
                 LOGGER.info("→ device: %s/%s", command, subcommand)
                 try:
                     await ws.send(encode_frame(self.serial, command, subcommand, txid, payload))
