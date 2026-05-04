@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.11 — pH no-clobber, debugged
+
+- Fix the 0.1.10 no-clobber not actually preventing pH overwrites in some cases. Was only kicking in when `last_test_iso` was already set; now also handles the first-settings-after-boot case.
+- INFO log when we keep a live pH against a stale settings value, so you can tell from the log that the protection fired.
+- DEBUG log of the comparison values for diagnosing edge cases.
+
+## 0.1.10 — water counter logging + pH no-clobber
+
+- Log deltas on `used_water_ml`, `waste_current_ml`, and `used_water_ml_v0` whenever a settings frame ticks them. Lets you see in the bridge log whether empty/fill commands actually moved water (without needing visual on the device or a HA dashboard refresh).
+- Fix pH/kh getting overwritten by history values when a settings frame arrives. Settings carries the LAST completed KH test's results in `history[0]` — for measurements made between full KH tests (e.g. via Refresh pH / Measure pH), we now keep the live value rather than reverting to the older test reading.
+
 ## 0.1.9 — refresh state without crashing the device
 
 - 0.1.8's Refresh State sent `khConnect/join` to force a fresh settings push. **This crashes the device's network stack hard enough to require a power cycle** (the device stops responding to all WS clients and eventually drops off the network with Errno 113 / no route to host).

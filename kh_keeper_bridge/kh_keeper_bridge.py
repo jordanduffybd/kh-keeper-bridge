@@ -671,14 +671,49 @@ class KHKeeperClient:
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception("Failed to parse settings: %s", exc)
                     return
-                # Helpful diagnostic: log when used_water_ml ticks up — that's
+                # Don't let the history-derived pH/kh overwrite a fresher
+                # value we already have from a khRefresh/pH push. Settings
+                # carries history[0]'s values which are from the LAST
+                # completed KH test — measurePh updates can be newer.
+                live_ph = self.last_state.get("ph")
+                live_kh = self.last_state.get("kh")
+                history_ph = update.get("ph")
+                history = update.get("history") or []
+                history_ts = history[0].get("timestamp") if history else None
+                last_test_iso = self.last_state.get("last_test_time")
+                same_test = bool(history_ts) and history_ts == last_test_iso
+                LOGGER.debug(
+                    "settings no-clobber check: live_ph=%s history_ph=%s "
+                    "history_ts=%s last_test_iso=%s same_test=%s",
+                    live_ph, history_ph, history_ts, last_test_iso, same_test,
+                )
+                # Apply if the new history is the SAME completed test we
+                # already had — meaning the history pH is stale vs our
+                # live one. Also apply if there's no history yet but we
+                # have a live pH (e.g. fresh boot, first measurePh).
+                if (same_test or last_test_iso is None) and live_ph is not None:
+                    if update.get("ph") != live_ph:
+                        LOGGER.info("Keeping live pH %s (settings carried stale %s)",
+                                    live_ph, update.get("ph"))
+                    update["ph"] = live_ph
+                if (same_test or last_test_iso is None) and live_kh is not None:
+                    update["kh"] = live_kh
+                # Helpful diagnostic: log when water counters tick — that's
                 # how we can tell doseAquarium / empty actually did something
                 # physical even though state stays Idle.
-                prev_used = self.last_state.get("used_water_ml")
-                new_used = update.get("used_water_ml")
-                if prev_used is not None and new_used is not None and new_used != prev_used:
-                    LOGGER.info("used_water_ml: %s → %s (Δ %.2f mL)",
-                                prev_used, new_used, new_used - prev_used)
+                #   used_water_ml   — aquarium water pumped IN (doseAquarium)
+                #   waste_current_ml — water pumped OUT to waste (empty)
+                #   used_water_ml_v0 — older per-test counter
+                for field, label in (
+                    ("used_water_ml", "used_water_ml (lifetime IN)"),
+                    ("waste_current_ml", "waste_current_ml (drained OUT)"),
+                    ("used_water_ml_v0", "used_water_ml_v0 (per-test)"),
+                ):
+                    prev_v = self.last_state.get(field)
+                    new_v = update.get(field)
+                    if prev_v is not None and new_v is not None and new_v != prev_v:
+                        LOGGER.info("%s: %s → %s (Δ %+.2f)",
+                                    label, prev_v, new_v, new_v - prev_v)
                 self.last_state.update(update)
                 self._connected.set()
                 await self.on_state(dict(self.last_state), self.serial, self.sw_version)
