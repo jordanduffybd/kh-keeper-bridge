@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.4 — proper pH refresh (HAR-verified bytes)
+## 0.1.5 — proper pH refresh (HAR-verified bytes)
 
 - Captured exact byte payloads from the device's web UI HAR export. Replaces the previous guesswork:
   - `khCommand/empty` takes a 4-byte magic payload `0a ae 60 00` (likely drain duration). Previous empty-payload version was wrong and silently no-op'd.
