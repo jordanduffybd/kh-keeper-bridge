@@ -321,6 +321,12 @@ def parse_status(payload: bytes) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 class KHKeeperClient:
+    # Force-reconnect if we haven't received any frame from the device in
+    # this many seconds. Settings frames usually arrive at least every
+    # minute or two when anything changes; a long quiet period means
+    # the WS is silently dead.
+    STALE_FRAME_TIMEOUT = 300  # 5 minutes
+
     def __init__(self, host: str, on_state):
         self.host = host
         self.on_state = on_state
@@ -329,6 +335,7 @@ class KHKeeperClient:
         self.last_state: dict[str, Any] = {}
         self.commands: asyncio.Queue[tuple[str, str, bytes]] = asyncio.Queue()
         self._connected = asyncio.Event()
+        self._last_frame_at: float = 0.0
 
     async def queue_command(self, command: str, subcommand: str, payload: bytes = b"") -> None:
         await self.commands.put((command, subcommand, payload))
@@ -442,18 +449,25 @@ class KHKeeperClient:
         uri = f"ws://{self.host}/controler"
         origin_header = f"http://{self.host}"
         LOGGER.info("Connecting to %s", uri)
+        # WS-level keepalive: lib pings every 20s, drops the connection if no
+        # pong in 15s. Catches the half-dead-TCP case where outbound writes
+        # succeed but the device has stopped responding.
         async with websockets.connect(
             uri,
             subprotocols=["arduino"],
-            ping_interval=None,
+            ping_interval=20,
+            ping_timeout=15,
+            close_timeout=5,
             origin=origin_header,
             user_agent_header="Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15",
         ) as ws:
             LOGGER.info("Connected. Requesting config...")
             await ws.send(encode_frame("", "get", "config", "", b""))
+            self._last_frame_at = time.monotonic()
 
             ping_task = asyncio.create_task(self._ping_loop(ws))
             cmd_task = asyncio.create_task(self._command_pump(ws))
+            watch_task = asyncio.create_task(self._watchdog(ws))
             try:
                 async for raw in ws:
                     if not isinstance(raw, (bytes, bytearray)):
@@ -462,6 +476,7 @@ class KHKeeperClient:
             finally:
                 ping_task.cancel()
                 cmd_task.cancel()
+                watch_task.cancel()
 
     async def _ping_loop(self, ws) -> None:
         try:
@@ -469,6 +484,26 @@ class KHKeeperClient:
                 await asyncio.sleep(30)
                 if self.serial:
                     await ws.send(encode_frame(self.serial, "ping", "ping", "", b""))
+        except (asyncio.CancelledError, ConnectionClosed):
+            pass
+
+    async def _watchdog(self, ws) -> None:
+        """Force-close the WS if we haven't seen any frame from the device
+        in STALE_FRAME_TIMEOUT seconds. Closing triggers a reconnect via
+        run_forever, which re-fetches config + settings and unsticks state."""
+        try:
+            while True:
+                await asyncio.sleep(30)
+                if self._last_frame_at == 0.0:
+                    continue
+                idle = time.monotonic() - self._last_frame_at
+                if idle > self.STALE_FRAME_TIMEOUT:
+                    LOGGER.warning(
+                        "No frames from device in %.0fs — forcing reconnect",
+                        idle,
+                    )
+                    await ws.close(code=1011, reason="stale connection")
+                    return
         except (asyncio.CancelledError, ConnectionClosed):
             pass
 
@@ -499,6 +534,9 @@ class KHKeeperClient:
             LOGGER.debug("Malformed frame: %s", data.hex())
             return
 
+        # Mark we're alive — watchdog uses this to detect dead connections.
+        self._last_frame_at = time.monotonic()
+
         LOGGER.debug("RX %s/%s txid=%s len=%d", command, subcommand, txid, len(payload))
 
         if command == "refresh" and subcommand == "config":
@@ -523,6 +561,17 @@ class KHKeeperClient:
                 if update:
                     self.last_state.update(update)
                     await self.on_state(dict(self.last_state), self.serial, self.sw_version)
+                return
+
+            if subcommand == "pH" and len(payload) >= 4:
+                # Live pH update (4-byte fixed-point i32). Push it through
+                # so the dashboard stays current between settings frames.
+                try:
+                    ph = round(struct.unpack(">i", payload[:4])[0] / SCALE, 2)
+                except struct.error:
+                    return
+                self.last_state["ph"] = ph
+                await self.on_state(dict(self.last_state), self.serial, self.sw_version)
                 return
 
         # Other frames (calibration, alerts, pong, etc.) are ignored for now.
