@@ -1,0 +1,25 @@
+name: KH Keeper Bridge
+version: "0.1.0"
+slug: kh_keeper_bridge
+description: Bridge for Reef Factory KH Keeper -> Home Assistant via MQTT auto-discovery
+url: https://github.com/jordanduffy/kh-keeper-bridge
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+init: false
+boot: auto
+startup: services
+host_network: false
+services:
+  - mqtt:need
+options:
+  device_host: 192.168.1.229
+  log_level: info
+  trigger_test_on_start: false
+schema:
+  device_host: str
+  log_level: list(debug|info|warning|error)
+  trigger_test_on_start: bool
