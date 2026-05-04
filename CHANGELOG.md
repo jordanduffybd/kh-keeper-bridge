@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.9 — refresh state without crashing the device
+
+- 0.1.8's Refresh State sent `khConnect/join` to force a fresh settings push. **This crashes the device's network stack hard enough to require a power cycle** (the device stops responding to all WS clients and eventually drops off the network with Errno 113 / no route to host).
+- Switched to `khSet/settings` written with the *current* alarm values — an idempotent no-op write that the device replies to with a full settings broadcast. Safe.
+- Same auto-refresh after empty/fill/measurePh — now uses the safe path.
+- **If your device is currently unreachable**: power-cycle it before deploying 0.1.9.
+
 ## 0.1.8 — manual & automatic state refresh
 
 - New **Refresh State** HA button. Re-sends `khConnect/join` to force the device to broadcast a fresh `khRefresh/settings` frame, which carries every diagnostic field (used_water_ml, waste_*, mixer, alarms, calibration, etc.).

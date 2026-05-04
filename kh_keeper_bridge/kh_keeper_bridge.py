@@ -449,18 +449,25 @@ class KHKeeperClient:
     async def refresh_state(self) -> None:
         """Force the device to re-broadcast its current settings frame.
 
-        Re-sending `khConnect/join` makes the device reply with a full
-        `khRefresh/settings`, which gets parsed into every sensor we
-        expose. Useful when nothing's changed state-wise but you want
-        to see the current state of all diagnostic fields after running
-        a sequence of commands.
+        Re-sends `khSet/settings` with the *current* alarm values — an
+        idempotent no-op write that the device responds to with a full
+        `khRefresh/settings` push. Captures every diagnostic field
+        without actually changing anything.
+
+        Earlier we tried `khConnect/join` for this; turns out re-joining
+        an already-joined session causes the device to stop responding
+        and the keepalive eventually times out. khSet/settings is safe.
         """
-        if not self.serial:
-            LOGGER.warning("refresh_state skipped — no serial yet")
+        low = self.last_state.get("alarm_kh_low")
+        high = self.last_state.get("alarm_kh_high")
+        if low is None or high is None:
+            LOGGER.warning("refresh_state skipped — alarms not loaded yet")
             return
-        LOGGER.info("Queued: refresh state (khConnect/join)")
-        payload = self.serial.encode("ascii") + b"\x00"
-        await self.queue_command("khConnect", "join", payload)
+        low_raw = int(round(low * SCALE))
+        high_raw = int(round(high * SCALE))
+        payload = struct.pack(">ii", low_raw, high_raw) + b"\x00" * 9
+        LOGGER.info("Queued: refresh state (khSet/settings no-op)")
+        await self.queue_command("khSet", "settings", payload)
 
     async def measure_ph(self) -> None:
         """Trigger a fresh pH reading via `khCommand/measurePh`. Empty

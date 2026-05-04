@@ -1,5 +1,5 @@
 name: KH Keeper Bridge
-version: "0.1.8"
+version: "0.1.9"
 slug: kh_keeper_bridge
 description: Bridge for Reef Factory KH Keeper -> Home Assistant via MQTT auto-discovery
 url: https://github.com/jordanduffy/kh-keeper-bridge
