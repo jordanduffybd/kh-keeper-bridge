@@ -1,6 +1,29 @@
 # Changelog
 
+> **Compatibility convention:** every release entry below states the HA Core (and HAOS, when relevant) versions it was developed and tested against. **Compatibility is verified on those versions only.** Upgrading HA past the listed version isn't guaranteed to work — check the next release for an updated compat line before upgrading. If you want to upgrade HA first and don't see a release here that lists the new version, hold off or test on a non-prod instance.
+
+## 0.1.13 — refresh-pH progress visibility + 0.1.12 entity-name correction
+
+**Tested against:** HA Core `2026.4.4` (dev + prod), Supervisor `2026.04.2`, HAOS `17.2`. Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
+
+The 0.1.12 `refresh_ph` cycle is silent for ~10 minutes between the empty/fill commands and the final pH measurement. Users had no way to tell whether the cycle was actively running, stuck, or failed. 0.1.13 adds two MQTT-discovered sensors that surface the current phase and an ETA timestamp, so a dashboard tile can show "draining (eta in 4 minutes)" / "filling (eta in 5 minutes)" / "measuring" / "idle".
+
+- **`sensor.kh_keeper_refresh_ph_phase`** — current phase as a string: `idle`, `draining`, `filling`, `measuring`. Updates immediately when each phase begins (not waiting for the next settings frame).
+- **`sensor.kh_keeper_refresh_ph_phase_eta`** — ISO-8601 timestamp (TIMESTAMP device class) of when the current phase is expected to complete. Populated for `draining` (now + 5min) and `filling` (now + 5min); null for `measuring` (device responds in ~1s) and `idle`.
+- Phase is reset to `idle` when the pure-water `khRefresh/pH` frame is consumed by the cycle (so the dashboard tile clears automatically). Manual `Measure pH` presses do not touch the phase — leaves an in-progress refresh_ph indicator alone.
+
+**0.1.12 entity-name correction (informational, no code change in 0.1.12):** the actual entity_ids that prod registered after install were:
+
+- `sensor.kh_keeper_ph_pure_tank_water` (not `sensor.kh_keeper_ph_pure`)
+- `sensor.kh_keeper_ph_kh_test_water_reagent` (not `sensor.kh_keeper_ph_kh_test`)
+
+This is because HA's MQTT discovery generates entity_ids from the `name` (friendly name), not the `object_id` field we specify in the discovery payload. The shorter names in the original 0.1.12 CHANGELOG were aspirational; the actual entity_ids match the friendly names. Any reeftanktracker `auto_source` config should target `sensor.kh_keeper_ph_pure_tank_water`.
+
+**Test infrastructure (recovered from 0.1.12 PR — was missed in the original merge):** added 48 pytest cases (was 0) covering pH frame routing, cuvette timing, refresh_ph orchestration, settings parser, drop-test calibration, payload encoders, idle gating, frame protocol round-trip, and the new phase tracking. Plus `pyproject.toml` with pytest-asyncio config and a GitHub Actions tests workflow. CI runs on push + PR against Python 3.11 and 3.12.
+
 ## 0.1.12 — split pH sensors + correct cuvette cycle timing
+
+**Tested against:** HA Core `2026.4.4` (dev) and `2026.4.4` (prod, installed). Supervisor `2026.04.2`. HAOS `17.2` (latest at time of release: `17.3`; HA Core latest: `2026.5.0` — release not yet verified against either). Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
 
 Two related fixes around the pH measurement procedure:
 
@@ -8,11 +31,13 @@ Two related fixes around the pH measurement procedure:
 
 **Split pH into two sensors so you stop conflating two different solutions.** A pH from a KH test is the pH of tank water + alkalinity reagent (different solution from pure tank water). Today both readings landed on the single `sensor.kh_keeper_ph` entity, which made it useless as an aquarium-pH advisor input. Now:
 
-- **`sensor.kh_keeper_ph_pure`** — populated only by `refresh_ph` (empty + fill fresh tank water + measurePh). This is the correct input for any aquarium pH advisor or dashboard tile that represents the tank's pH. Friendly name: "pH (Pure Tank Water)".
-- **`sensor.kh_keeper_ph_kh_test`** — populated only when a NEW KH test's `history[0].timestamp` differs from the last consumed one. Friendly name: "pH (KH Test, Water + Reagent)". Useful for diagnostics (detecting reagent issues, batch drift) but DO NOT substitute for pure-water pH in advisor logic. Marked diagnostic.
+- **`sensor.kh_keeper_ph_pure_tank_water`** — populated only by `refresh_ph` (empty + fill fresh tank water + measurePh). This is the correct input for any aquarium pH advisor or dashboard tile that represents the tank's pH. Friendly name: "pH (Pure Tank Water)".
+- **`sensor.kh_keeper_ph_kh_test_water_reagent`** — populated only when a NEW KH test's `history[0].timestamp` differs from the last consumed one. Friendly name: "pH (KH Test, Water + Reagent)". Useful for diagnostics (detecting reagent issues, batch drift) but DO NOT substitute for pure-water pH in advisor logic. Marked diagnostic.
 - **`sensor.kh_keeper_ph`** — kept for back-compat. Reflects whatever the device last reported; semantics unchanged. New consumers should use one of the two split sensors.
 
-To get pH advisor working correctly, swap the `auto_source` for the `pH` parameter in reeftanktracker from `sensor.kh_keeper_ph` → `sensor.kh_keeper_ph_pure`.
+> **Entity_id note:** HA's MQTT discovery generates entity_ids from the friendly `name`, not the `object_id` field. The `object_id` we specify (`ph_pure`, `ph_kh_test`) is ignored, so the actual entity_ids end up matching the friendly name (`ph_pure_tank_water`, `ph_kh_test_water_reagent`). Document accordingly.
+
+To get pH advisor working correctly, swap the `auto_source` for the `pH` parameter in reeftanktracker from `sensor.kh_keeper_ph` → `sensor.kh_keeper_ph_pure_tank_water`.
 
 ## 0.1.11 — pH no-clobber, debugged
 

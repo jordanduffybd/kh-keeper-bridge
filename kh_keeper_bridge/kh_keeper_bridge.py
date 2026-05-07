@@ -67,7 +67,7 @@ import logging
 import struct
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 try:
@@ -336,6 +336,15 @@ class KHKeeperClient:
     EMPTY_DURATION_S = 300   # 5 minutes
     FILL_DURATION_S = 300    # 5 minutes
 
+    # Refresh-pH cycle phases — surfaced as `refresh_ph_phase` in
+    # last_state and as `sensor.kh_keeper_refresh_ph_phase` over MQTT
+    # so the user can see where the cycle is up to during the otherwise
+    # silent ~10-minute window.
+    PHASE_IDLE = "idle"
+    PHASE_DRAINING = "draining"
+    PHASE_FILLING = "filling"
+    PHASE_MEASURING = "measuring"
+
     def __init__(self, host: str, on_state):
         self.host = host
         self.on_state = on_state
@@ -532,24 +541,60 @@ class KHKeeperClient:
         await self.queue_command("khCommand", "doseAquarium", payload)
         await self.refresh_state()
 
+    async def _set_refresh_ph_phase(
+        self, phase: str, duration_s: float | None = None,
+    ) -> None:
+        """Update `refresh_ph_phase` + `refresh_ph_phase_eta` in last_state
+        and push to MQTT. The eta is ISO-8601 of "now + duration_s" (in
+        local tz so HA's TIMESTAMP device class renders it correctly), or
+        None when the phase has no defined duration (e.g. PHASE_IDLE,
+        PHASE_MEASURING which completes asynchronously).
+        """
+        local_tz = datetime.now().astimezone().tzinfo
+        eta_iso: str | None = None
+        if duration_s and duration_s > 0:
+            eta_iso = (
+                datetime.now(tz=local_tz)
+                + timedelta(seconds=duration_s)
+            ).isoformat(timespec="seconds")
+        self.last_state["refresh_ph_phase"] = phase
+        self.last_state["refresh_ph_phase_eta"] = eta_iso
+        LOGGER.info(
+            "refresh_ph_phase: %s%s",
+            phase,
+            f" (eta {eta_iso})" if eta_iso else "",
+        )
+        # Publish immediately so the user sees the phase change in HA
+        # without waiting for the next settings frame to arrive.
+        if self.serial:
+            await self.on_state(
+                dict(self.last_state), self.serial, self.sw_version,
+            )
+
     async def refresh_ph(self, fill_ml: float = 50.0) -> None:
         """Get a fresh pH reading on tank water — no reagent burned.
 
         Sequence (with realistic device timing):
           1. Queue `empty` — drains cuvette over ~5 minutes. Device is
-             silent and ignores commands during this window.
+             silent and ignores commands during this window. Phase
+             surfaces as `draining` with eta = now + 5min.
           2. Wait `EMPTY_DURATION_S` (300s) for the drain to complete.
           3. Queue `doseAquarium fill_ml` — fills with fresh tank water
-             over another ~5 minutes. Device silent again.
+             over another ~5 minutes. Phase: `filling`, eta = now + 5min.
           4. Wait `FILL_DURATION_S` (300s) for the fill to complete.
           5. Queue `measurePh` — reads the pH of pure tank water.
+             Phase: `measuring` (no eta — device responds within ~1s).
           6. Set `_next_ph_is_pure` so the resulting `khRefresh/pH`
-             frame is routed to the `ph_pure` field (not `ph_kh_test`).
+             frame is routed to the `ph_pure_tank_water` field (not
+             `ph_kh_test_water_reagent`). The pH frame handler resets
+             phase back to `idle` once it consumes the reading.
 
         Total runtime: ~10 minutes. Refuses to run if the device is busy
         with another operation. Earlier code waited only 55s and frequently
         measured stale (still-reagent) water — see `EMPTY_DURATION_S`
-        comment.
+        comment. Phase + eta are exposed as `sensor.kh_keeper_refresh_ph_phase`
+        / `sensor.kh_keeper_refresh_ph_phase_eta` so the user has visibility
+        into the otherwise silent 10-minute window.
         """
         if not self._require_idle("refresh pH"):
             return
@@ -557,21 +602,25 @@ class KHKeeperClient:
             "Queued: refresh pH (empty %ds → fill %.1f mL %ds → measurePh)",
             self.EMPTY_DURATION_S, fill_ml, self.FILL_DURATION_S,
         )
+        await self._set_refresh_ph_phase(
+            self.PHASE_DRAINING, duration_s=self.EMPTY_DURATION_S,
+        )
         await self.queue_command("khCommand", "empty", b"\x00\x0a\xae\x60\x00")
-        LOGGER.info("Waiting %ds for cuvette drain to complete...",
-                    self.EMPTY_DURATION_S)
         await asyncio.sleep(self.EMPTY_DURATION_S)
 
+        await self._set_refresh_ph_phase(
+            self.PHASE_FILLING, duration_s=self.FILL_DURATION_S,
+        )
         raw = int(round(fill_ml * SCALE))
         await self.queue_command("khCommand", "doseAquarium", struct.pack(">i", raw))
-        LOGGER.info("Waiting %ds for cuvette fill to complete...",
-                    self.FILL_DURATION_S)
         await asyncio.sleep(self.FILL_DURATION_S)
 
+        await self._set_refresh_ph_phase(self.PHASE_MEASURING)
         # Mark the NEXT pH frame as a pure-water reading. The frame
-        # handler will write `ph_pure` and then clear the flag.
+        # handler will write `ph_pure_tank_water` and then clear the
+        # flag (and the phase, back to idle).
         self._next_ph_is_pure = True
-        LOGGER.info("Queued: measurePh (next reading → ph_pure)")
+        LOGGER.info("Queued: measurePh (next reading → ph_pure_tank_water)")
         await self.queue_command("khCommand", "measurePh", b"")
 
     async def wait_until_ready(self) -> None:
@@ -796,10 +845,14 @@ class KHKeeperClient:
                 # cuvette holds PURE TANK WATER. Route to ph_pure so
                 # downstream consumers (advisor, automations) don't
                 # confuse it with the water+reagent pH from a KH test.
+                # Also reset the refresh_ph_phase tracker back to idle
+                # so the dashboard tile clears.
                 if self._next_ph_is_pure:
                     self.last_state["ph_pure"] = ph
                     self._next_ph_is_pure = False
-                    LOGGER.info("ph_pure (pure tank water): %s", ph)
+                    self.last_state["refresh_ph_phase"] = self.PHASE_IDLE
+                    self.last_state["refresh_ph_phase_eta"] = None
+                    LOGGER.info("ph_pure (pure tank water): %s — refresh_ph cycle complete", ph)
                 await self.on_state(dict(self.last_state), self.serial, self.sw_version)
                 return
 
@@ -929,6 +982,18 @@ class MQTTPublisher:
             ("ph_kh_test", "pH (KH Test, Water + Reagent)",
              "{{ value_json.ph_kh_test }}",
              None, None, "measurement", "mdi:flask-empty-outline", True),
+            # Refresh-pH cycle progress (added 0.1.13). Visible to the
+            # user during the otherwise silent ~10-minute drain+fill
+            # window so they know the cycle hasn't stalled. Phase
+            # values: idle, draining, filling, measuring. ETA is the
+            # local-tz timestamp the current phase is expected to end
+            # (None when no ETA — e.g. measuring or idle).
+            ("refresh_ph_phase", "Refresh pH Phase",
+             "{{ value_json.refresh_ph_phase }}",
+             None, None, None, "mdi:water-sync", False),
+            ("refresh_ph_phase_eta", "Refresh pH Phase ETA",
+             "{{ value_json.refresh_ph_phase_eta }}",
+             None, "timestamp", None, "mdi:clock-end", False),
             ("state", "State", "{{ value_json.state }}", None, None, None, "mdi:state-machine", False),
             ("progress", "Measurement Progress", "{{ value_json.state_percent }}", "%", None, "measurement", "mdi:progress-clock", False),
             ("last_alert", "Last Test Result", "{{ value_json.last_test_alert }}", None, None, None, "mdi:alert-circle-check", False),
