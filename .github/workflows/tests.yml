@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        # The bridge module sys.exit(1)s on import if websockets is
+        # missing, so install it (plus paho-mqtt for MQTT publisher
+        # imports) even though the unit tests stub all I/O. Listed in
+        # kh_keeper_bridge/requirements.txt.
+        run: |
+          pip install pytest pytest-asyncio
+          pip install -r kh_keeper_bridge/requirements.txt
+      - name: Run tests
+        run: pytest tests/
