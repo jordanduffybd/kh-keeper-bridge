@@ -1,6 +1,10 @@
 # Changelog
 
+> **Compatibility convention:** every release entry below states the HA Core (and HAOS, when relevant) versions it was developed and tested against. **Compatibility is verified on those versions only.** Upgrading HA past the listed version isn't guaranteed to work — check the next release for an updated compat line before upgrading. If you want to upgrade HA first and don't see a release here that lists the new version, hold off or test on a non-prod instance.
+
 ## 0.1.12 — split pH sensors + correct cuvette cycle timing
+
+**Tested against:** HA Core `2026.4.4` (dev) and `2026.4.4` (prod, installed). Supervisor `2026.04.2`. HAOS `17.2` (latest at time of release: `17.3`; HA Core latest: `2026.5.0` — release not yet verified against either). Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
 
 Two related fixes around the pH measurement procedure:
 
