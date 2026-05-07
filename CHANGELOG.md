@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.12 — split pH sensors + correct cuvette cycle timing
+
+Two related fixes around the pH measurement procedure:
+
+**Cuvette cycle timing.** `refresh_ph` previously queued empty + fill back-to-back and slept 55s before triggering measurePh. Real device timing is ~5 minutes per pump operation (drain + fill = ~10 minutes total), and the device is silent and ignores commands during each phase. The 55s wait was wildly insufficient — measurePh frequently fired against still-stale water from the prior KH test, producing the "pH unchanged at X (cuvette water didn't refresh?)" log noise. Now: queue empty → wait 300s → queue fill → wait 300s → queue measurePh. New `EMPTY_DURATION_S` and `FILL_DURATION_S` class constants document the timing.
+
+**Split pH into two sensors so you stop conflating two different solutions.** A pH from a KH test is the pH of tank water + alkalinity reagent (different solution from pure tank water). Today both readings landed on the single `sensor.kh_keeper_ph` entity, which made it useless as an aquarium-pH advisor input. Now:
+
+- **`sensor.kh_keeper_ph_pure`** — populated only by `refresh_ph` (empty + fill fresh tank water + measurePh). This is the correct input for any aquarium pH advisor or dashboard tile that represents the tank's pH. Friendly name: "pH (Pure Tank Water)".
+- **`sensor.kh_keeper_ph_kh_test`** — populated only when a NEW KH test's `history[0].timestamp` differs from the last consumed one. Friendly name: "pH (KH Test, Water + Reagent)". Useful for diagnostics (detecting reagent issues, batch drift) but DO NOT substitute for pure-water pH in advisor logic. Marked diagnostic.
+- **`sensor.kh_keeper_ph`** — kept for back-compat. Reflects whatever the device last reported; semantics unchanged. New consumers should use one of the two split sensors.
+
+To get pH advisor working correctly, swap the `auto_source` for the `pH` parameter in reeftanktracker from `sensor.kh_keeper_ph` → `sensor.kh_keeper_ph_pure`.
+
 ## 0.1.11 — pH no-clobber, debugged
 
 - Fix the 0.1.10 no-clobber not actually preventing pH overwrites in some cases. Was only kicking in when `last_test_iso` was already set; now also handles the first-settings-after-boot case.

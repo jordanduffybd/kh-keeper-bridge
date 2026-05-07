@@ -327,6 +327,15 @@ class KHKeeperClient:
     # the WS is silently dead.
     STALE_FRAME_TIMEOUT = 300  # 5 minutes
 
+    # Cuvette-cycle timing (operational reality, not in protocol docs):
+    # Empty drains for ~5 minutes, then fill takes ~5 minutes. The device
+    # is silent during both phases and IGNORES new commands sent in that
+    # window. We must wait for each phase to complete before queueing the
+    # next operation. Earlier code assumed ~55s for the full cycle and
+    # measurePh frequently fired against still-stale water.
+    EMPTY_DURATION_S = 300   # 5 minutes
+    FILL_DURATION_S = 300    # 5 minutes
+
     def __init__(self, host: str, on_state):
         self.host = host
         self.on_state = on_state
@@ -336,6 +345,15 @@ class KHKeeperClient:
         self.commands: asyncio.Queue[tuple[str, str, bytes]] = asyncio.Queue()
         self._connected = asyncio.Event()
         self._last_frame_at: float = 0.0
+        # Set when a refresh_ph cycle is mid-flight and the next
+        # khRefresh/pH frame should be routed to `ph_pure` (pure tank
+        # water, no reagent). Cleared once the frame is consumed.
+        self._next_ph_is_pure: bool = False
+        # Tracks the timestamp of the last KH-test history entry we
+        # consumed, so we can detect when a NEW completed test arrives
+        # and update `ph_kh_test` from history[0].ph. Avoids re-publishing
+        # the same value every time settings re-broadcast.
+        self._last_kh_test_ts: str | None = None
 
     async def queue_command(self, command: str, subcommand: str, payload: bytes = b"") -> None:
         await self.commands.put((command, subcommand, payload))
@@ -517,24 +535,43 @@ class KHKeeperClient:
     async def refresh_ph(self, fill_ml: float = 50.0) -> None:
         """Get a fresh pH reading on tank water — no reagent burned.
 
-        Sequence: empty → fill (fresh aquarium water) → measurePh.
-        Queues empty + fill back-to-back so the device drives them with
-        minimal dry time on the pH probe. measurePh waits until the
-        cuvette has water again.
+        Sequence (with realistic device timing):
+          1. Queue `empty` — drains cuvette over ~5 minutes. Device is
+             silent and ignores commands during this window.
+          2. Wait `EMPTY_DURATION_S` (300s) for the drain to complete.
+          3. Queue `doseAquarium fill_ml` — fills with fresh tank water
+             over another ~5 minutes. Device silent again.
+          4. Wait `FILL_DURATION_S` (300s) for the fill to complete.
+          5. Queue `measurePh` — reads the pH of pure tank water.
+          6. Set `_next_ph_is_pure` so the resulting `khRefresh/pH`
+             frame is routed to the `ph_pure` field (not `ph_kh_test`).
 
-        Refuses to run if the device is busy with another operation.
+        Total runtime: ~10 minutes. Refuses to run if the device is busy
+        with another operation. Earlier code waited only 55s and frequently
+        measured stale (still-reagent) water — see `EMPTY_DURATION_S`
+        comment.
         """
         if not self._require_idle("refresh pH"):
             return
-        LOGGER.info("Queued: refresh pH (empty → fill %.1f mL → measurePh)", fill_ml)
-        # The internal _require_idle calls in empty/fill/measure will
-        # be skipped because we already checked, but they're cheap.
-        await self.queue_command("khCommand", "empty", b"\x0a\xae\x60\x00")
+        LOGGER.info(
+            "Queued: refresh pH (empty %ds → fill %.1f mL %ds → measurePh)",
+            self.EMPTY_DURATION_S, fill_ml, self.FILL_DURATION_S,
+        )
+        await self.queue_command("khCommand", "empty", b"\x00\x0a\xae\x60\x00")
+        LOGGER.info("Waiting %ds for cuvette drain to complete...",
+                    self.EMPTY_DURATION_S)
+        await asyncio.sleep(self.EMPTY_DURATION_S)
+
         raw = int(round(fill_ml * SCALE))
         await self.queue_command("khCommand", "doseAquarium", struct.pack(">i", raw))
-        # Wait for both pump operations to complete before measuring.
-        # Drain ~18s + fill at ~1 mL/s for 50 mL = ~50s. Buffer + 5s.
-        await asyncio.sleep(55)
+        LOGGER.info("Waiting %ds for cuvette fill to complete...",
+                    self.FILL_DURATION_S)
+        await asyncio.sleep(self.FILL_DURATION_S)
+
+        # Mark the NEXT pH frame as a pure-water reading. The frame
+        # handler will write `ph_pure` and then clear the flag.
+        self._next_ph_is_pure = True
+        LOGGER.info("Queued: measurePh (next reading → ph_pure)")
         await self.queue_command("khCommand", "measurePh", b"")
 
     async def wait_until_ready(self) -> None:
@@ -698,6 +735,22 @@ class KHKeeperClient:
                     update["ph"] = live_ph
                 if (same_test or last_test_iso is None) and live_kh is not None:
                     update["kh"] = live_kh
+                # Detect a NEW completed KH test → publish its pH as
+                # `ph_kh_test`. This is the pH of tank water + alk
+                # reagent (the test medium), NOT pure tank water.
+                # Different solution; never substitute for `ph_pure`
+                # in advisor inputs.
+                if (
+                    history_ts
+                    and history_ts != self._last_kh_test_ts
+                    and history_ph is not None
+                ):
+                    update["ph_kh_test"] = history_ph
+                    self._last_kh_test_ts = history_ts
+                    LOGGER.info(
+                        "ph_kh_test (water+reagent) updated from new KH "
+                        "test at %s: %s", history_ts, history_ph,
+                    )
                 # Helpful diagnostic: log when water counters tick — that's
                 # how we can tell doseAquarium / empty actually did something
                 # physical even though state stays Idle.
@@ -739,6 +792,14 @@ class KHKeeperClient:
                 else:
                     LOGGER.info("pH unchanged at %s (cuvette water didn't refresh?)", ph)
                 self.last_state["ph"] = ph
+                # If this frame was triggered by a refresh_ph cycle, the
+                # cuvette holds PURE TANK WATER. Route to ph_pure so
+                # downstream consumers (advisor, automations) don't
+                # confuse it with the water+reagent pH from a KH test.
+                if self._next_ph_is_pure:
+                    self.last_state["ph_pure"] = ph
+                    self._next_ph_is_pure = False
+                    LOGGER.info("ph_pure (pure tank water): %s", ph)
                 await self.on_state(dict(self.last_state), self.serial, self.sw_version)
                 return
 
@@ -853,6 +914,21 @@ class MQTTPublisher:
             # (object_id, name, value_template, unit, device_class, state_class, icon, diagnostic)
             ("kh", "KH", "{{ value_json.kh }}", "dKH", None, "measurement", "mdi:flask", False),
             ("ph", "pH", "{{ value_json.ph }}", None, None, "measurement", "mdi:water-percent", False),
+            # Pure-tank-water pH — only updated by `refresh_ph` cycle
+            # (empty + fill fresh tank water + measurePh). This is the
+            # right input for any pH advisor / dashboard tile that
+            # represents the aquarium's pH. Updates roughly once per
+            # manual refresh_ph trigger.
+            ("ph_pure", "pH (Pure Tank Water)", "{{ value_json.ph_pure }}",
+             None, None, "measurement", "mdi:water-percent", False),
+            # KH-test pH — pH of tank water + alkalinity reagent at the
+            # end of the last completed KH measurement. DIFFERENT
+            # SOLUTION from pure tank water; do not substitute. Useful
+            # for diagnostics / detecting reagent issues, not for
+            # aquarium pH tracking.
+            ("ph_kh_test", "pH (KH Test, Water + Reagent)",
+             "{{ value_json.ph_kh_test }}",
+             None, None, "measurement", "mdi:flask-empty-outline", True),
             ("state", "State", "{{ value_json.state }}", None, None, None, "mdi:state-machine", False),
             ("progress", "Measurement Progress", "{{ value_json.state_percent }}", "%", None, "measurement", "mdi:progress-clock", False),
             ("last_alert", "Last Test Result", "{{ value_json.last_test_alert }}", None, None, None, "mdi:alert-circle-check", False),
