@@ -2,6 +2,34 @@
 
 > **Compatibility convention:** every release entry below states the HA Core (and HAOS, when relevant) versions it was developed and tested against. **Compatibility is verified on those versions only.** Upgrading HA past the listed version isn't guaranteed to work — check the next release for an updated compat line before upgrading. If you want to upgrade HA first and don't see a release here that lists the new version, hold off or test on a non-prod instance.
 
+## 0.1.14 — Fix: refresh-pH cycle was clobbering `ph` (water+reagent) with the pure-water reading
+
+**Tested against:** HA Core `2026.4.4` (dev + prod), Supervisor `2026.04.2`, HAOS `17.2`. Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
+
+### Bug
+
+User reported on prod that the "Refresh pH" routine was updating the wrong sensor — the regular `KH Keeper pH` (water+reagent KH-test cuvette pH) was getting overwritten with the pure-water reading instead of routing to `KH Keeper pH (Pure Tank Water)`.
+
+### Root cause
+
+In `_handle_frame`'s pH-frame branch (`kh_keeper_bridge.py:843`), the bridge unconditionally wrote the incoming pH value to `last_state["ph"]` BEFORE checking the `_next_ph_is_pure` flag — then ALSO wrote to `last_state["ph_pure"]` when the flag was set. So during a refresh_ph cycle the pure-water pH ended up in both fields, clobbering the last KH-test cuvette pH.
+
+The existing tests in `test_ph_routing.py` were inline mock-replicas of the intended logic — they didn't actually call the real handler, so they reproduced the buggy code path AND asserted the buggy result (the assertions said `ph == pure_value` after a pure cycle, exactly what the bug produced).
+
+### Fix
+
+`_handle_frame` now partitions the routing properly:
+- `_next_ph_is_pure=True` → write ONLY to `ph_pure`, leave `ph` untouched, clear the phase tracker
+- `_next_ph_is_pure=False` → write to `ph` (water+reagent assumed), leave `ph_pure` untouched
+
+The standalone `measure_ph` button's docstring is updated to clarify routing: it always writes to `ph`. Users who want a pure-water reading should call `refresh_ph` instead, which sequences the empty + refill + measure + correct routing.
+
+### Tests
+
+`tests/test_ph_routing.py` — three existing tests rewritten to call the real `_handle_frame` with properly-encoded frames (instead of inline mocks), so future regressions in the routing logic are caught. New `test_pure_pH_frame_writes_only_ph_pure_not_ph` is the bug-fix regression test that seeds a prior `ph` value, runs a pure cycle, and asserts `ph` is unchanged.
+
+48 passing.
+
 ## 0.1.13 — refresh-pH progress visibility + 0.1.12 entity-name correction
 
 **Tested against:** HA Core `2026.4.4` (dev + prod), Supervisor `2026.04.2`, HAOS `17.2`. Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
