@@ -16,7 +16,6 @@ old conflated value.
 """
 from __future__ import annotations
 
-import asyncio
 import struct
 
 import pytest
@@ -42,61 +41,71 @@ def _ph_frame(ph_value: float) -> bytes:
 # ph_pure routing — only set when refresh_ph is mid-cycle
 # ---------------------------------------------------------------------------
 async def test_ph_frame_without_pending_pure_does_not_set_ph_pure(client):
-    """A passive measurePh response (e.g. user pressed Measure pH manually,
-    or device auto-fired) must NOT populate ph_pure — we don't know what
-    was in the cuvette. Only ph (legacy) updates."""
-    # Simulate the frame handler's pH branch by calling the relevant logic
-    # directly — the WS-handling code is too tangled for a unit test.
-    # Mirror the actual code path in _handle_frame.
+    """A passive measurePh response (user pressed Measure pH manually,
+    or device auto-fired) must NOT populate ph_pure — we don't know
+    what was in the cuvette. Only `ph` (water+reagent assumed) updates."""
+    from kh_keeper_bridge.kh_keeper_bridge import encode_frame
+    client.serial = "ABC123"
     client._next_ph_is_pure = False
-    payload = _ph_frame(8.21)
-    ph = round(struct.unpack(">i", payload[:4])[0] / SCALE, 2)
-    client.last_state["ph"] = ph
-    if client._next_ph_is_pure:
-        client.last_state["ph_pure"] = ph
-        client._next_ph_is_pure = False
+    frame = encode_frame(
+        client.serial, "khRefresh", "pH", "txid_test", _ph_frame(8.21),
+    )
+    await client._handle_frame(ws=None, data=frame)
 
     assert client.last_state.get("ph") == 8.21
     assert "ph_pure" not in client.last_state
 
 
-async def test_ph_frame_with_pending_pure_sets_ph_pure_and_clears_flag(client):
-    """When refresh_ph has set _next_ph_is_pure=True, the next pH frame
-    populates ph_pure AND clears the flag (so a subsequent unrelated
-    measurePh doesn't get incorrectly tagged as pure)."""
+async def test_pure_pH_frame_writes_only_ph_pure_not_ph(client):
+    """Bug-fix regression test: when `_next_ph_is_pure=True`, the
+    incoming pH frame represents pure tank water. It must populate
+    `ph_pure` ONLY — `ph` (the water+reagent KH-test cuvette pH) must
+    remain unchanged. Earlier behaviour wrote both, clobbering the
+    last KH-test pH with a pure-water reading."""
+    # Seed: simulate that a recent KH test left ph at 8.45 (water+reagent)
+    client.last_state["ph"] = 8.45
+    # Now a refresh_ph cycle queues measurePh and the pure-water reading
+    # arrives at 7.92.
     client._next_ph_is_pure = True
-    payload = _ph_frame(8.05)
-    ph = round(struct.unpack(">i", payload[:4])[0] / SCALE, 2)
-    client.last_state["ph"] = ph
-    if client._next_ph_is_pure:
-        client.last_state["ph_pure"] = ph
-        client._next_ph_is_pure = False
 
-    assert client.last_state.get("ph") == 8.05
-    assert client.last_state.get("ph_pure") == 8.05
-    assert client._next_ph_is_pure is False
+    # Drive the real frame handler with a properly-encoded khRefresh/pH
+    # frame. This catches regressions in the routing logic itself, not
+    # an inline mock of the intended logic.
+    from kh_keeper_bridge.kh_keeper_bridge import encode_frame
+    client.serial = "ABC123"
+    frame = encode_frame(
+        client.serial, "khRefresh", "pH", "txid_test", _ph_frame(7.92),
+    )
+    await client._handle_frame(ws=None, data=frame)
+
+    assert client.last_state.get("ph_pure") == 7.92
+    assert client.last_state.get("ph") == 8.45  # untouched
+    assert client._next_ph_is_pure is False  # flag consumed
 
 
 async def test_ph_pure_flag_only_consumed_by_first_frame(client):
     """If two pH frames arrive after a refresh_ph cycle, only the FIRST
-    populates ph_pure. The second is treated as an unrelated measurement
-    (because the cuvette state is no longer guaranteed pure)."""
+    populates ph_pure. The second is treated as a regular measurePh
+    (because the flag was consumed; cuvette state is unknown)."""
+    from kh_keeper_bridge.kh_keeper_bridge import encode_frame
+    client.serial = "ABC123"
     client._next_ph_is_pure = True
-    # First frame
-    payload1 = _ph_frame(8.05)
-    ph1 = round(struct.unpack(">i", payload1[:4])[0] / SCALE, 2)
-    if client._next_ph_is_pure:
-        client.last_state["ph_pure"] = ph1
-        client._next_ph_is_pure = False
-    # Second frame arrives later
-    payload2 = _ph_frame(8.10)
-    ph2 = round(struct.unpack(">i", payload2[:4])[0] / SCALE, 2)
-    client.last_state["ph"] = ph2
-    if client._next_ph_is_pure:
-        client.last_state["ph_pure"] = ph2
+
+    # First frame — pure-water reading, routes to ph_pure
+    frame1 = encode_frame(
+        client.serial, "khRefresh", "pH", "txid1", _ph_frame(8.05),
+    )
+    await client._handle_frame(ws=None, data=frame1)
+
+    # Second frame arrives later — flag is cleared, treated as regular
+    # measurePh result (water+reagent assumed). Routes to ph.
+    frame2 = encode_frame(
+        client.serial, "khRefresh", "pH", "txid2", _ph_frame(8.10),
+    )
+    await client._handle_frame(ws=None, data=frame2)
 
     assert client.last_state.get("ph_pure") == 8.05  # first wins
-    assert client.last_state.get("ph") == 8.10       # second updates legacy
+    assert client.last_state.get("ph") == 8.10       # second routes to ph
 
 
 # ---------------------------------------------------------------------------

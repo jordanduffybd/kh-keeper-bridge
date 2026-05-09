@@ -501,10 +501,15 @@ class KHKeeperClient:
         payload. Device replies with a `khRefresh/pH` frame containing
         the new value (4-byte fixed-point) within ~1s. No reagent.
 
+        ROUTING: the resulting pH frame writes to `ph` (the
+        water+reagent KH-test cuvette pH). If you want a pure tank
+        water pH reading instead, call `refresh_ph()` — it empties +
+        refills with fresh tank water, then runs measurePh and routes
+        the result to `ph_pure`.
+
         NOTE: pH is measured on whatever water is currently in the
-        cuvette, which is usually stale from the last KH test. For a
-        useful tank reading, use refresh_ph() which empties + refills
-        + measures.
+        cuvette. For a routine tank reading, use refresh_ph() which
+        empties + refills + measures + routes correctly.
         """
         if not self._require_idle("measurePh"):
             return
@@ -829,30 +834,52 @@ class KHKeeperClient:
                 return
 
             if subcommand == "pH" and len(payload) >= 4:
-                # Live pH update (4-byte fixed-point i32). Push it through
-                # so the dashboard stays current between settings frames.
+                # Live pH update (4-byte fixed-point i32). The pH frame
+                # arrives both as a side-effect of khCommand/measurePh
+                # (which we trigger) AND between KH tests (device may
+                # auto-refresh). Routing depends on what's currently in
+                # the cuvette:
+                #   - Pure tank water (post refresh_ph cycle) → `ph_pure`
+                #   - Water + reagent (post KH test, or default) → `ph`
+                # We track this via `_next_ph_is_pure`, set to True by
+                # refresh_ph just before queueing measurePh and cleared
+                # when the resulting pH frame arrives.
                 try:
                     ph = round(struct.unpack(">i", payload[:4])[0] / SCALE, 2)
                 except struct.error:
                     return
-                prev_ph = self.last_state.get("ph")
-                if prev_ph != ph:
-                    LOGGER.info("pH UPDATE: %s → %s", prev_ph, ph)
-                else:
-                    LOGGER.info("pH unchanged at %s (cuvette water didn't refresh?)", ph)
-                self.last_state["ph"] = ph
-                # If this frame was triggered by a refresh_ph cycle, the
-                # cuvette holds PURE TANK WATER. Route to ph_pure so
-                # downstream consumers (advisor, automations) don't
-                # confuse it with the water+reagent pH from a KH test.
-                # Also reset the refresh_ph_phase tracker back to idle
-                # so the dashboard tile clears.
                 if self._next_ph_is_pure:
+                    # Pure tank water reading from a refresh_ph cycle.
+                    # Route ONLY to ph_pure — DON'T touch `ph`, which
+                    # represents the water+reagent KH-test cuvette pH
+                    # and would be wrong if overwritten with this value.
+                    prev_pure = self.last_state.get("ph_pure")
                     self.last_state["ph_pure"] = ph
                     self._next_ph_is_pure = False
                     self.last_state["refresh_ph_phase"] = self.PHASE_IDLE
                     self.last_state["refresh_ph_phase_eta"] = None
-                    LOGGER.info("ph_pure (pure tank water): %s — refresh_ph cycle complete", ph)
+                    LOGGER.info(
+                        "ph_pure (pure tank water): %s → %s — "
+                        "refresh_ph cycle complete; `ph` (water+reagent) "
+                        "left unchanged",
+                        prev_pure, ph,
+                    )
+                else:
+                    # Standalone measurePh / device-driven update.
+                    # Cuvette assumed to hold KH-test water (water +
+                    # reagent). The standalone Measure pH button
+                    # documents this — if the user wants a pure-water
+                    # reading they should call refresh_ph instead.
+                    prev_ph = self.last_state.get("ph")
+                    if prev_ph != ph:
+                        LOGGER.info("pH UPDATE: %s → %s", prev_ph, ph)
+                    else:
+                        LOGGER.info(
+                            "pH unchanged at %s (cuvette water didn't "
+                            "refresh?)",
+                            ph,
+                        )
+                    self.last_state["ph"] = ph
                 await self.on_state(dict(self.last_state), self.serial, self.sw_version)
                 return
 

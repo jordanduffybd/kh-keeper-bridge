@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kh-keeper-bridge"
-version = "0.1.13"
+version = "0.1.14"
 description = "Bridge for Reef Factory KH Keeper -> Home Assistant via MQTT auto-discovery"
 requires-python = ">=3.11"
 
