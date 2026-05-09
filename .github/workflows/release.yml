@@ -1,0 +1,95 @@
+name: release
+
+# Auto-cuts a GitHub release whenever the version bumps on main.
+# Reads version from `kh_keeper_bridge/config.yaml` (the HA add-on
+# manifest). The CHANGELOG.md section for that version becomes the
+# release body. Idempotent: skips silently if a tag for the version
+# already exists.
+#
+# Workflow:
+# 1. PR merges to main → triggers this workflow
+# 2. Read `version` from `kh_keeper_bridge/config.yaml`
+# 3. If `v<version>` tag already exists, no-op
+# 4. Otherwise, extract the matching `## <version>` section from
+#    CHANGELOG.md and create a release with that body + the tag
+#
+# Same pattern as reeftanktracker's release workflow, adapted for the
+# add-on's version-source file (`config.yaml` instead of
+# `manifest.json`).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read add-on version
+        id: version
+        run: |
+          # config.yaml stores `version: "0.1.14"` (quoted). Parse with
+          # plain shell rather than installing a YAML parser — the line
+          # is well-formed and the regex is unambiguous.
+          VERSION=$(grep -E '^version:' kh_keeper_bridge/config.yaml \
+            | head -1 \
+            | sed -E 's/^version:[[:space:]]*"?([^"]+)"?[[:space:]]*$/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read version from kh_keeper_bridge/config.yaml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected add-on version: $VERSION"
+
+      - name: Check if release tag already exists
+        id: tag
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists — skipping release."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG does not exist — will create release."
+          fi
+
+      - name: Extract CHANGELOG section
+        if: steps.tag.outputs.exists == 'false'
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          awk -v ver="$VERSION" '
+            /^## / {
+              if (match($0, "^## " ver "($| )")) { found=1; print; next }
+              if (found) { exit }
+            }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "## ${VERSION}" > release_notes.md
+            echo "" >> release_notes.md
+            echo "_No CHANGELOG entry found for v${VERSION}. See commit history._" >> release_notes.md
+          fi
+          echo "----- release_notes.md preview -----"
+          head -20 release_notes.md
+          echo "----- END preview -----"
+
+      - name: Create GitHub release
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --target main \
+            --title "${VERSION}" \
+            --notes-file release_notes.md
+          echo "Released v${VERSION}"
