@@ -67,7 +67,7 @@ import logging
 import struct
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 try:
@@ -320,6 +320,10 @@ def parse_status(payload: bytes) -> dict[str, Any]:
 # WebSocket client
 # ---------------------------------------------------------------------------
 
+async def _async_noop(*_a, **_kw) -> None:
+    return None
+
+
 class KHKeeperClient:
     # Force-reconnect if we haven't received any frame from the device in
     # this many seconds. Settings frames usually arrive at least every
@@ -345,9 +349,15 @@ class KHKeeperClient:
     PHASE_FILLING = "filling"
     PHASE_MEASURING = "measuring"
 
-    def __init__(self, host: str, on_state):
+    def __init__(self, host: str, on_state, on_calibration_event=None):
         self.host = host
         self.on_state = on_state
+        # Fires once per detected `adjustment` change in the settings
+        # frame. Receives a dict {prev, new, delta, ts, source,
+        # hanna_value}. Reeftank consumes this to record the Hanna
+        # value as a manual reading and to mark a settling window so
+        # the alk advisor doesn't attribute the step-change to dose.
+        self.on_calibration_event = on_calibration_event or (lambda _e: _async_noop())
         self.serial: str | None = None
         self.sw_version: str | None = None
         self.last_state: dict[str, Any] = {}
@@ -363,6 +373,15 @@ class KHKeeperClient:
         # and update `ph_kh_test` from history[0].ph. Avoids re-publishing
         # the same value every time settings re-broadcast.
         self._last_kh_test_ts: str | None = None
+        # Attribution for the NEXT detected adjustment change. Set by
+        # set_adjustment / calibrate_from_drop_test before the command
+        # is queued; consumed (and cleared) when we see the device
+        # echo the new value back in a settings frame.
+        # Shape: {"source": str, "hanna_value": float|None,
+        #         "intended_adjustment": float, "set_at": float}
+        # When None, an observed change is attributed to "device"
+        # (likely a physical-UI calibration on the tester).
+        self._pending_calibration_attribution: dict[str, Any] | None = None
 
     async def queue_command(self, command: str, subcommand: str, payload: bytes = b"") -> None:
         await self.commands.put((command, subcommand, payload))
@@ -376,15 +395,27 @@ class KHKeeperClient:
         LOGGER.info("Queued: cancel current measurement")
         await self.queue_command("khMeasurement", "cancel", b"")
 
-    async def set_adjustment(self, dkh: float) -> None:
+    async def set_adjustment(self, dkh: float, _attribution: dict[str, Any] | None = None) -> None:
         """Set the absolute KH adjustment (signed dKH offset).
 
         E.g. -1.5 means the device subtracts 1.5 dKH from raw measurements
         before display. Pass 0 to reset adjustment.
+
+        `_attribution` is set by `calibrate_from_drop_test` to carry the
+        Hanna value through so the next observed adjustment change can
+        be tagged with the test reading that drove it. When None we
+        attribute to a raw HA-side adjustment (no Hanna value known).
         """
         raw = int(round(dkh * SCALE))
         payload = struct.pack(">i", raw)
-        LOGGER.info("Queued: set adjustment to %+.2f dKH (raw=%d)", dkh, raw)
+        self._pending_calibration_attribution = _attribution or {
+            "source": "ha_raw",
+            "hanna_value": None,
+            "intended_adjustment": round(dkh, 2),
+            "set_at": time.time(),
+        }
+        LOGGER.info("Queued: set adjustment to %+.2f dKH (raw=%d) [%s]",
+                    dkh, raw, self._pending_calibration_attribution["source"])
         await self.queue_command("khSet", "adjust", payload)
 
     async def calibrate_from_drop_test(self, drop_test_kh: float) -> None:
@@ -414,7 +445,12 @@ class KHKeeperClient:
             "drop_test=%.2f → new_adjustment=%+.2f",
             displayed, current_adj, raw_kh, drop_test_kh, new_adj,
         )
-        await self.set_adjustment(new_adj)
+        await self.set_adjustment(new_adj, _attribution={
+            "source": "ha_drop_test",
+            "hanna_value": round(drop_test_kh, 2),
+            "intended_adjustment": new_adj,
+            "set_at": time.time(),
+        })
 
     async def set_alarms(self, low_dkh: float, high_dkh: float) -> None:
         """Set KH alarm low/high thresholds.
@@ -821,6 +857,56 @@ class KHKeeperClient:
                     if prev_v is not None and new_v is not None and new_v != prev_v:
                         LOGGER.info("%s: %s → %s (Δ %+.2f)",
                                     label, prev_v, new_v, new_v - prev_v)
+                # Calibration detection: the `adjustment` field is the
+                # signed dKH offset the device adds to every raw reading
+                # before display. When it changes between frames, a
+                # calibration just happened — either via this bridge
+                # (drop-test or raw set_adjustment), via the Smart Reef
+                # mobile app, or via the device's physical UI. Surface
+                # it as an event so reeftank can record the Hanna value
+                # and mark a settling window.
+                prev_adj = self.last_state.get("adjustment")
+                new_adj = update.get("adjustment")
+                if (prev_adj is not None and new_adj is not None
+                        and prev_adj != new_adj):
+                    attribution = self._pending_calibration_attribution
+                    self._pending_calibration_attribution = None
+                    # If we have a pending attribution but the device
+                    # didn't echo back what we asked for (within 0.05
+                    # dKH rounding tolerance), don't trust the link —
+                    # treat as a device-side calibration instead.
+                    if attribution and abs(
+                            attribution["intended_adjustment"] - new_adj) > 0.05:
+                        LOGGER.info(
+                            "Pending attribution %s discarded: intended %+.2f != "
+                            "observed %+.2f",
+                            attribution["source"],
+                            attribution["intended_adjustment"], new_adj,
+                        )
+                        attribution = None
+                    event = {
+                        "prev": prev_adj,
+                        "new": new_adj,
+                        "delta": round(new_adj - prev_adj, 2),
+                        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "source": attribution["source"] if attribution else "device",
+                        "hanna_value": attribution["hanna_value"] if attribution else None,
+                        "serial": self.serial,
+                    }
+                    LOGGER.info(
+                        "CALIBRATION: adjustment %+.2f → %+.2f (Δ %+.2f) "
+                        "source=%s hanna=%s",
+                        prev_adj, new_adj, event["delta"],
+                        event["source"], event["hanna_value"],
+                    )
+                    try:
+                        await self.on_calibration_event(event)
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.warning("on_calibration_event handler failed: %s", exc)
+                    # Stash on last_state so downstream consumers that
+                    # only see state snapshots (e.g. test/print mode)
+                    # can still see the most recent calibration.
+                    update["last_calibration"] = event
                 self.last_state.update(update)
                 self._connected.set()
                 await self.on_state(dict(self.last_state), self.serial, self.sw_version)
@@ -976,6 +1062,30 @@ class MQTTPublisher:
     def _availability_topic(self, serial: str) -> str:
         return f"{self.node_prefix}/{serial}/availability"
 
+    def _calibration_event_topic(self, serial: str) -> str:
+        # Non-retained — each calibration emits one message. Subscribers
+        # (reeftank) treat each arrival as a discrete event.
+        return f"{self.node_prefix}/{serial}/event/calibration"
+
+    def _last_calibration_topic(self, serial: str) -> str:
+        # Retained — survives restarts so reeftank's startup sync sees
+        # the most recent calibration even if it missed the event.
+        return f"{self.node_prefix}/{serial}/last_calibration"
+
+    async def publish_calibration_event(self, event: dict) -> None:
+        """Publish a calibration event to both the event topic (one-shot)
+        and the retained last_calibration topic. Serial is taken from
+        the event payload (set by KHKeeperClient)."""
+        serial = event.get("serial")
+        if not serial:
+            LOGGER.warning("publish_calibration_event: no serial in event")
+            return
+        payload = json.dumps(event)
+        self.client.publish(self._calibration_event_topic(serial), payload, retain=False)
+        self.client.publish(self._last_calibration_topic(serial), payload, retain=True)
+        LOGGER.info("Published calibration event: %s → %s (Δ %+.2f) src=%s",
+                    event["prev"], event["new"], event["delta"], event["source"])
+
     def _discover(self, serial: str, sw_version: str | None) -> None:
         device = {
             "identifiers": [f"{self.node_prefix}_{serial}"],
@@ -1067,6 +1177,29 @@ class MQTTPublisher:
 
             topic = f"{self.discovery_prefix}/sensor/{self.node_prefix}_{serial}/{object_id}/config"
             self.client.publish(topic, json.dumps(payload), retain=True)
+
+        # Last calibration — published to a SEPARATE retained topic
+        # (last_calibration_topic) rather than the bulk state topic so
+        # the retained payload is the event itself, not the whole
+        # device state. State = ISO timestamp (so HA shows time-ago),
+        # attributes = prev / new / delta / source / hanna_value.
+        last_cal_payload = {
+            "name": "Last Calibration",
+            "unique_id": f"{self.node_prefix}_{serial}_last_calibration",
+            "object_id": "kh_keeper_last_calibration",
+            "state_topic": self._last_calibration_topic(serial),
+            "value_template": "{{ value_json.ts }}",
+            "json_attributes_topic": self._last_calibration_topic(serial),
+            "device_class": "timestamp",
+            "icon": "mdi:tune-vertical-variant",
+            "device": device,
+            **availability,
+        }
+        last_cal_topic = (
+            f"{self.discovery_prefix}/sensor/{self.node_prefix}_{serial}"
+            f"/last_calibration/config"
+        )
+        self.client.publish(last_cal_topic, json.dumps(last_cal_payload), retain=True)
 
         # Binary sensors for boolean alerts and diagnostic flags
         for object_id, name, tmpl, dev_class, icon, diag in [
@@ -1247,12 +1380,58 @@ class MQTTPublisher:
         LOGGER.info("← MQTT command on %s: %r", msg.topic, payload)
         asyncio.run_coroutine_threadsafe(handler(payload), self.loop)
 
+    # Sensors declared with a `date` / `timestamp` device class. Home
+    # Assistant renders `{{ value_json.<key> }}` as an EMPTY STRING when the
+    # key is absent from the published JSON (Jinja undefined), and then logs
+    # `Invalid state message '' from '<state topic>'` because '' isn't a
+    # parseable datetime. Publishing an explicit JSON null instead renders as
+    # "None", which HA maps to `unknown` silently. So every key listed here
+    # must ALWAYS be present in the state payload, even before the device has
+    # sent us a value for it.
+    TIMESTAMP_KEYS = (
+        "last_test_time",
+        "next_test_time",
+        "calibration_due",
+        "refresh_ph_phase_eta",
+    )
+
+    def _publish_state(self, serial: str, state: dict | None) -> bool:
+        """Serialise `state` and publish it to the retained state topic.
+
+        Returns True if a message was actually published.
+
+        Never publishes an empty or whitespace-only payload to the state
+        topic — HA can't do anything with one and just logs warnings. This
+        guard is deliberately scoped to the STATE topic only: discovery /
+        config topics may legitimately publish an empty payload to clear a
+        retained config, and must not be affected.
+        """
+        if not state:
+            LOGGER.debug(
+                "Skipping state publish for %s — no state to publish yet", serial,
+            )
+            return False
+        publishable = {k: v for k, v in state.items() if k != "history"}
+        # Guarantee timestamp/date-typed keys are present (as null) so their
+        # value_templates render "None" rather than "" — see TIMESTAMP_KEYS.
+        for key in self.TIMESTAMP_KEYS:
+            publishable.setdefault(key, None)
+        payload = json.dumps(publishable)
+        if not payload.strip():
+            LOGGER.debug(
+                "Skipping state publish for %s — serialised payload was empty",
+                serial,
+            )
+            return False
+        self.client.publish(self._state_topic(serial), payload, retain=True)
+        return True
+
     async def __call__(self, state: dict, serial: str, sw_version: str | None) -> None:
         if not self.discovered:
             self._discover(serial, sw_version)
             self.discovered = True
-        publishable = {k: v for k, v in state.items() if k != "history"}
-        self.client.publish(self._state_topic(serial), json.dumps(publishable), retain=True)
+        if not self._publish_state(serial, state):
+            return
         LOGGER.info("Published: KH=%s pH=%s state=%s%s reagent=%smL",
                     state.get("kh"), state.get("ph"),
                     state.get("state"),
@@ -1305,6 +1484,7 @@ async def main_async(args) -> None:
             discovery_prefix=args.discovery_prefix,
         )
         client.on_state = publisher
+        client.on_calibration_event = publisher.publish_calibration_event
 
     # Schedule any one-shot CLI commands once the client has joined
     one_shots: list = []

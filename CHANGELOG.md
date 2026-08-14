@@ -2,6 +2,61 @@
 
 > **Compatibility convention:** every release entry below states the HA Core (and HAOS, when relevant) versions it was developed and tested against. **Compatibility is verified on those versions only.** Upgrading HA past the listed version isn't guaranteed to work — check the next release for an updated compat line before upgrading. If you want to upgrade HA first and don't see a release here that lists the new version, hold off or test on a non-prod instance.
 
+## 0.1.16 — Fix: HA logging `Invalid state message ''` on the state topic
+
+**Tested against:** HA Core `2026.7.2` (prod), Supervisor `2026.04.2`, HAOS `17.2`. Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
+
+### Bug
+
+Production HA log, 753 occurrences between 2026-08-10 and 2026-08-14 and still firing:
+
+```
+WARNING homeassistant.components.mqtt.sensor
+Invalid state message '' from 'kh_keeper/RFKH022304210017/state'
+```
+
+### Root cause
+
+The `''` in that warning is the **rendered value_template**, not the raw MQTT payload — HA logs it from the `date`/`timestamp` device-class branch of `mqtt/sensor.py` after `dt_util.parse_datetime()` fails. Jinja renders `{{ value_json.<key> }}` as an empty string when the key is *absent* from the published JSON (undefined), whereas an explicit JSON `null` renders as `"None"`, which HA maps to `unknown` silently.
+
+The bridge published `{k: v for k, v in state.items() if k != "history"}` — i.e. only the keys the device had actually given us. Any timestamp/date sensor whose key wasn't in `last_state` yet rendered `''` and warned on **every** publish:
+
+- `refresh_ph_phase_eta` (added 0.1.13) is only ever written by `_set_refresh_ph_phase`, so with `ph_refresh_interval_minutes: 0` (the default, and the user's setting) the key never appeared at all — a warning on every single state publish, forever. This accounts for the steady ~8/hour drip.
+- `last_test_time` / `next_test_time` / `calibration_due` are absent until the first `khRefresh/settings` frame lands, so any `khRefresh/status` or `khRefresh/pH` publish before that also warned.
+
+### Fix
+
+New `MQTTPublisher._publish_state()` (`kh_keeper_bridge/kh_keeper_bridge.py`), called from `MQTTPublisher.__call__`:
+
+- Always includes the date/timestamp-typed keys (`MQTTPublisher.TIMESTAMP_KEYS`) in the payload, as JSON `null` when unknown. Existing values are never overwritten (`setdefault`).
+- Skips the publish entirely — logged at **DEBUG**, so the noise isn't just relocated to our own log — if the state is empty/`None` or would serialise to an empty/whitespace-only payload. The state topic can no longer receive an empty payload under any code path.
+
+The guard is scoped to the **state topic only**. Discovery/config topic publishes are untouched: sending an empty payload to a discovery topic to clear a retained config is a legitimate MQTT pattern and remains available.
+
+### Tests
+
+New `tests/test_state_publish_guard.py` — 6 tests covering: empty-dict and `None` state publish nothing, `_publish_state` returns `False` when it skips, no empty/whitespace payload ever reaches the state topic, a populated state publishes retained with all values unchanged (and `history` still stripped), and missing timestamp keys are published as `null`. All 63 tests pass (57 existing + 6 new).
+
+## 0.1.15 — Feature: emit calibration events when the `adjustment` offset changes
+
+**Tested against:** HA Core `2026.4.4` (dev + prod), Supervisor `2026.04.2`, HAOS `17.2`. Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
+
+### Why
+
+The `adjustment` field on the device is the signed dKH offset added to every raw reading before display. The user tunes it ~monthly by running a Hanna drop test and entering the result via the `KH Keeper Calibrate KH from Drop Test` number entity. Before 0.1.15 the bridge tracked the *current* offset but didn't surface *when* it changed or *what value* drove it — meaning downstream consumers (Reef Tank Tracker's alk advisor) saw the resulting KH step-change as an unexplained "consumption spike" and overcorrected dosing. In production this contributed to a 6.1× spec-drift advisor warning on the Foundation B head.
+
+### What changed
+
+- New MQTT topic `kh_keeper/<serial>/event/calibration` (non-retained) — fires once per detected offset change with `{prev, new, delta, ts, source, hanna_value, serial}`.
+- New MQTT topic `kh_keeper/<serial>/last_calibration` (retained) — survives restarts so subscribers can sync on startup.
+- New HA-discovered sensor `sensor.kh_keeper_last_calibration` (state = ISO timestamp, attributes = full event payload).
+- `calibrate_from_drop_test` now stashes the Hanna value the user entered onto a `_pending_calibration_attribution` field; the next observed adjustment change carries it as `hanna_value` and `source: "ha_drop_test"`. Direct `set_adjustment` calls are tagged `source: "ha_raw"`. Changes the bridge didn't initiate (Smart Reef mobile app, physical UI) are tagged `source: "device"`.
+- If the device echoes back a value different from what we asked for (>0.05 dKH tolerance) the pending attribution is discarded — the change is treated as device-side.
+
+### Tests
+
+New `tests/test_calibration_events.py` — 9 tests covering: no-event-when-unchanged, no-event-on-first-frame, event-fires-on-change, all three source attributions (`device` / `ha_drop_test` / `ha_raw`), Hanna value carry-through, attribution discarded on device-side override, and `last_calibration` state snapshot. All 57 tests pass (48 existing + 9 new).
+
 ## 0.1.14 — Fix: refresh-pH cycle was clobbering `ph` (water+reagent) with the pure-water reading
 
 **Tested against:** HA Core `2026.4.4` (dev + prod), Supervisor `2026.04.2`, HAOS `17.2`. Add-on slot: `kh_keeper_bridge`. MQTT broker: Mosquitto add-on (any 2.x).
